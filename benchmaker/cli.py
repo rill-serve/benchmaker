@@ -189,10 +189,18 @@ def arms(config_path: str, out_dir: str, run_id: str | None, labels: tuple[str, 
                         allow_mixed_jobs=True if allow_mixed_jobs else None,
                         progress=not quiet)
     if dry_run:
+        from benchmaker.core.arms import live_overlaps, stops_after
         s = runner.settings
         plan = plan_order([a.name for a in s.arms], s.reps, s.order, s.seed)
-        for rep, arm in plan:
-            sys.stdout.write(f"{arm} rep-{rep}{' (warmup)' if rep < s.warmup_reps else ''}\n")
+        by_name = {a.name: a for a in s.arms}
+        for i, (rep, arm) in enumerate(plan):
+            spec = by_name[arm]
+            stop = "  + stop" if spec.managed and stops_after(spec, plan, i) else ""
+            sys.stdout.write(f"{arm} rep-{rep}{' (warmup)' if rep < s.warmup_reps else ''}{stop}\n")
+        for a, b in live_overlaps(plan, by_name):
+            sys.stdout.write(f"⚠ {a} and {b} are both live at some point (relaunch "
+                             f"{by_name[a].relaunch}/{by_name[b].relaunch}); use relaunch: visit or "
+                             "every_rep if they share GPUs\n")
         return
 
     result = runner.run()

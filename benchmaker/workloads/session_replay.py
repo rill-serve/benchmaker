@@ -171,6 +171,12 @@ class ReplayWorkload(Workload):
     def item_count(self) -> Optional[int]:
         return sum(len(g) for g in self._groups)
 
+    @property
+    def model_labels(self) -> set[str]:
+        """Every ``model`` label the (filtered) rows carry — ``build_config`` checks
+        each has an endpoint when ``endpoints:`` routes by label (issue #15)."""
+        return {str(r["model"]) for g in self._groups for r in g if r.get("model") is not None}
+
     def content_hash(self) -> Optional[str]:
         return self.manifest.get("prompt_set_sha256")
 
@@ -182,6 +188,13 @@ class ReplayWorkload(Workload):
                 self._starts.append(at)
         elif self._trace_scale is not None:
             self._starts = [float(g[0].get("at_s", 0.0)) * self._trace_scale for g in self._groups]
+            # Admission walks the sessions in order and stops at the first one
+            # whose time has not come, so the list must be in ``at_s`` order —
+            # an unsorted file would otherwise hold back every session behind
+            # a late one (issue #16).
+            order = sorted(range(len(self._groups)), key=lambda i: (self._starts[i], i))
+            self._groups = [self._groups[i] for i in order]
+            self._starts = [self._starts[i] for i in order]
         else:
             self._starts = [0.0] * len(self._groups)
 

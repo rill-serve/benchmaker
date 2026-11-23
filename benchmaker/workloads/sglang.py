@@ -29,6 +29,7 @@ from typing import Any, Callable, Optional
 
 from benchmaker.env import load_dotenv
 from benchmaker.core.metrics import ITL_SERIES
+from benchmaker.workloads.llm import token_gaps
 from benchmaker.core.types import Request, Response, Sample
 from benchmaker.workloads._sse import reassemble_sse_lines
 from benchmaker.workloads.base import WorkloadType
@@ -179,6 +180,7 @@ class SGLangGenerateWorkloadType(WorkloadType):
         chunk_times = response.stream_chunk_times or []
         ttft: Optional[float] = None
         arrivals: list[float] = []
+        cumulative: list[int] = []  # meta_info.completion_tokens at each event (issue #17)
         last_text = ""
         completion_tokens: Optional[int] = None
         prompt_tokens: Optional[int] = None
@@ -203,16 +205,19 @@ class SGLangGenerateWorkloadType(WorkloadType):
             if not isinstance(obj, dict):
                 continue
             text = obj.get("text")
+            mi = obj.get("meta_info")
+            mi_ct = mi.get("completion_tokens") if isinstance(mi, dict) else None
             if isinstance(text, str) and text != last_text:
                 if ttft is None:
                     ttft = t
                 arrivals.append(t)
+                # The event's own count when it carried one, else the last seen.
+                cumulative.append(int(mi_ct) if mi_ct is not None else (cumulative[-1] if cumulative else 0))
                 last_text = text
-            mi = obj.get("meta_info")
             if isinstance(mi, dict):
                 mi_raw = dict(mi)
-                if mi.get("completion_tokens") is not None:
-                    completion_tokens = int(mi["completion_tokens"])
+                if mi_ct is not None:
+                    completion_tokens = int(mi_ct)
                 if mi.get("prompt_tokens") is not None:
                     prompt_tokens = int(mi["prompt_tokens"])
                 if mi.get("cached_tokens") is not None:
@@ -229,12 +234,25 @@ class SGLangGenerateWorkloadType(WorkloadType):
             sample.meta["ttft_token_index"] = 0
             sample.extra["ttft_token_index"] = 0.0
         if len(arrivals) >= 2:
-            itl = [(arrivals[i] - arrivals[i - 1]) * 1000.0
-                   for i in range(1, len(arrivals))]
-            sample.extra["itl_ms_mean"] = statistics.mean(itl)
-            sample.extra["itl_ms_p50"] = _pct(itl, 50)
-            sample.extra["itl_ms_p99"] = _pct(itl, 99)
-            sample.series[ITL_SERIES] = itl  # pooled across requests (#1)
+            # Per-token gaps (issue #17): sglang reports the cumulative
+            # completion_tokens with every event, so each event's exact token
+            # count is known; a read that delivered several events splits its
+            # gap over them.
+            per_event = [cumulative[i] - cumulative[i - 1] for i in range(1, len(cumulative))]
+            gaps = token_gaps(arrivals, [0] + per_event, completion_tokens=completion_tokens)
+            itl = gaps["itl_ms"]
+            if itl:
+                sample.extra["itl_ms_mean"] = statistics.mean(itl)
+                sample.extra["itl_ms_p50"] = _pct(itl, 50)
+                sample.extra["itl_ms_p99"] = _pct(itl, 99)
+                sample.series[ITL_SERIES] = itl  # pooled across requests (#1)
+            sample.meta["itl_mode"] = gaps["mode"]
+            chunk = gaps["itl_chunk_ms"]
+            if chunk:
+                sample.extra["itl_chunk_ms_mean"] = statistics.mean(chunk)
+                sample.extra["itl_chunk_ms_p50"] = _pct(chunk, 50)
+                sample.extra["itl_chunk_ms_p99"] = _pct(chunk, 99)
+            sample.extra["itl_coalesced_events"] = float(gaps["coalesced_events"])
         sample.extra["tokens_out"] = float(out_tokens)
         if prompt_tokens is not None:
             sample.extra["prompt_tokens"] = float(prompt_tokens)

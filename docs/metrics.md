@@ -81,8 +81,11 @@ repeatedly on the CLI; pass `labels={...}` from Python.
     "wrong_output": 2,           # delivered OK but graded wrong by a post-hook
     "error_rate": 0.001,
     "request_failure_rate": 0.0007,
-    "throughput_rps": 200.0,    # all responses / wall
-    "goodput_rps": 199.8,       # successes only / wall
+    "throughput_rps": 200.0,    # all measured responses / measured window (see below, #17)
+    "goodput_rps": 199.8,       # successes only / measured window
+    "wall_time_s": 32.1,        # the whole run: warm-up, ramp-up and drain included
+    "measured_window_s": 30.0,  # first measured request start .. last measured completion
+    "measured_window": {"start_s": 1.2, "end_s": 31.2},  # same, relative to the run start
     "bytes_sent": 1234567,
     "bytes_recv": 9876543,
     "status_codes": {"200": 5994, "429": 4, "500": 2},
@@ -97,10 +100,15 @@ repeatedly on the CLI; pass `labels={...}` from Python.
     # Per-workload-type extras (when present) — e.g. for OpenAIChatWorkloadType:
     "workload_metrics": {
         "ttft_s":       {"mean": 0.18, "p50": 0.16, "p90": 0.32, "p99": 0.55, "min": 0.12, "max": 0.71},
-        "itl_ms_mean":  { ... },        # per-request, then summarized
+        "itl_ms_mean":  { ... },        # per-request, then summarized — per token (#17)
+        "itl_chunk_ms_mean": { ... },   # the old per-network-read gaps, kept for comparison
         "itl_ms_pooled": {              # every decode step of every request in one pool (#1)
             "count": 51234, "mean": 11.8, "min": 0.9, "max": 612.0,
             "p50": 11.2, "p90": 12.1, "p99": 24.6, "p995": 41.0, "p999": 180.2
+        },
+        "itl_modes": {                  # how the gaps were counted (#17); docs/itl-cache-metrics.md
+            "modes": {"per_token": 5990, "per_token_estimated": 4},
+            "usage_mismatch_requests": 0, "coalesced_events_mean": 1.4, "tokens_per_event_mean": 1.3
         },
         "stalls": { ... },              # decode-stall accounting at stall_ms (#1); docs/itl-cache-metrics.md
         "tokens_out":   { ... },

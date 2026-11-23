@@ -73,7 +73,7 @@ workload:
   max_duration_s: 600           # requests arriving in the first 10 minutes
   max_input_tokens: 16384
   max_output_tokens: 2048
-  max_seq: 32768                # input + output > max_seq -> row dropped (issue #11)
+  max_seq: 32768                # input + unique_tail + output > max_seq -> row dropped (issue #11, #16)
   # --- rendering ---
   tokenizer: Qwen/Qwen2.5-7B    # token-exact prompts (needs `pip install -e .[hf]`); default: char mode
   chars_per_token: 4.0          # char mode only
@@ -110,6 +110,18 @@ Rows removed by `max_input_tokens` / `max_output_tokens` / `max_seq` are
 counted per reason and land in `manifest.json` under
 `prompt_set.provenance.dropped` (together with the replay parameters), so a
 reader can see that the "same" trace gave two runs different populations.
+So are the rows `max_records` / `max_duration_s` cut off the stream
+(`dropped.max_records`, `dropped.max_duration`; issue #16), and `max_seq`
+is checked against `input + unique_tail + output` — with a tail, a row near
+the limit used to be sent oversized and come back as a 400. `provenance.blocks`
+(`rows_with_hashes`, `padded_rows`, `unused_blocks`, `short_last_block_rows`)
+says how the hash blocks were rendered: rows longer than their blocks get a
+request-unique padded tail, trailing hash ids beyond the input are never
+rendered, and a partial last block is rendered short.
+
+With `loop: true` each pass re-seeds the request-unique content (tails,
+padded blocks), so pass 2 is not a byte-identical replay of pass 1 that
+would hit the cache for free (issue #16).
 
 ### `send: token_ids` — bypass the tokenizer (issue #11)
 

@@ -75,8 +75,11 @@ def test_normalize_endpoints_accepts_urls_and_mappings():
         "b": {"url": "http://b:8000/v1/chat/completions", "capability": "http://b:8000/server_info",
               "headers": {"X-Tenant": "x"}},
     })
-    assert eps["a"] == {"url": "http://a:8000", "capability": None, "headers": {}}
+    assert eps["a"] == {"url": "http://a:8000", "model": None, "capability": None, "headers": {}}
     assert eps["b"]["capability"] == "http://b:8000/server_info" and eps["b"]["headers"] == {"X-Tenant": "x"}
+    assert eps["b"]["model"] is None  # served name = the key unless aliased (#15)
+    alias = normalize_endpoints({"small": {"url": "http://a:8000", "model": "qwen2.5-7b"}})
+    assert alias["small"]["model"] == "qwen2.5-7b"
     assert normalize_endpoints(None) == {}
     with pytest.raises(ValueError):
         normalize_endpoints({"a": {"capability": "http://a/server_info"}})

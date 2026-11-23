@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- **Arm lifecycle fixes (#14):** a failed `ready_check` voids *every* rep of
+  its launch, not only the first that reused it; a failed `stop` hook voids
+  the launch's reps too (`stop_failure_voids`, default on); Ctrl-C while a
+  `start` hook runs cancels the hook's process group promptly and still
+  runs `stop` (the launch counts as live before the hook returns);
+  `relaunch: once` stops after the arm's last plan entry, in plan order, so
+  a failing stop hook is attributed to the launch. Arms that are both live
+  at the same time under the plan (`once` with ABBA) are warned about at
+  start, shown by `--dry-run` (`+ stop` markers and an overlap note) and
+  recorded in `plan.json` (`stops_after`, `overlaps`).
+- **Multi-server routing (#15):** with `endpoints:` nothing falls back to
+  `workload_type.url` — `build_config` checks up front that every model a
+  request can carry (workload type default, lane `model`, session/trace row
+  `model` labels) names an endpoint, and a request that still has none
+  fails with `RoutingError` and voids the rep (`routing` violation). An
+  endpoint entry may set `model:` to rewrite the body when the key is an
+  alias. `void_rules` are scoped per endpoint (`endpoint:` or a
+  `endpoints.<model>.<rest>` path; unscoped rules apply to all) and each
+  endpoint gets a capability snapshot without extra config (shared URL with
+  host swapped, else `/v1/models`).
+- **Replay fixes (#16):** a turn that raises is recorded as a failed sample
+  through the post-hooks, so a session-replay slot is released instead of
+  wedging the session; session files are admitted in `at_s` order whatever
+  order they are listed in; Mooncake `max_seq` counts the `unique_tail`,
+  rows cut off by `max_records` / `max_duration_s` are counted in
+  `provenance.dropped`, `provenance.blocks` reports how the hash blocks were
+  rendered, and `loop: true` re-seeds request-unique content per pass.
+- **Metrics (#17):** `itl_ms` is per token — tokens per event from
+  `usage.completion_tokens` (exact per-event counts for sglang), a read
+  that delivered several events splits its gap, `meta.itl_mode` /
+  `itl_modes` say how the gaps were counted, old per-read gaps kept as
+  `itl_chunk_ms_*`; throughput is measured over the measured requests'
+  window (`measured_window_s`), not the whole run including warm-up/ramp-up;
+  cache-source hints are read as whole words (`host_dram` is a restore tier,
+  `localhost` is not `local`) and an unknown vocabulary is `unknown` instead
+  of `device_hit`; void reps are excluded from the TTFT decomposition and
+  parity medians, and the decomposition no longer silently skips arms with
+  two or more reps.
 - **Session replay (#10):** the `session-replay` recipe and workload type run a
   prepared session file (manifest + one row per request): each session's turn
   k+1 goes out only after turn k completed plus a think time (row

@@ -210,6 +210,29 @@ def test_decompose_ttft_is_exact_and_symmetric():
     d3 = decompose_ttft(A, C)
     assert abs(d3["latency_ms"]) < 1e-9 and d3["delta_ms"] == pytest.approx(0.0)
 
+def test_decomposition_and_parity_exclude_void_reps():
+    """Void reps are not in the table (compare excludes them), so they must not
+    weigh on the TTFT decomposition or the parity medians either (#17)."""
+    void = {"void": True, "violations": [{"rule": "ready_check"}]}
+    a0 = RunRef("a", 0, "", _summary(0.10, {"device_hit": (0.5, 0.010), "miss": (0.5, 0.100)}))
+    a1 = RunRef("a", 1, "", _summary(0.12, {"device_hit": (0.5, 0.010), "miss": (0.5, 0.100)}))
+    # a void rep with a wildly different mix/latency: it would flip the decomposition
+    a2 = RunRef("a", 2, "", _summary(9.0, {"restore": (1.0, 9.0)}), meta={"void": True, "void_violations": void["violations"]})
+    b0 = RunRef("b", 0, "", _summary(0.05, {"device_hit": (0.8, 0.008), "miss": (0.2, 0.090)}, idx=0.0))
+    b1 = RunRef("b", 1, "", _summary(0.05, {"device_hit": (0.8, 0.008), "miss": (0.2, 0.090)}, idx=0.0))
+    b2 = RunRef("b", 2, "", _summary(0.05, {"device_hit": (0.8, 0.008), "miss": (0.2, 0.090)}, idx=7.0),
+                meta={"void": True})
+    res = build_comparison([a0, a1, a2, b0, b1, b2], ArmsSettings(metrics=["ttft_mean"], reps=3))
+    clean = build_comparison([a0, a1, b0, b1], ArmsSettings(metrics=["ttft_mean"], reps=2))
+    dec_b = next(d for d in res["decomposition"] if d["arm"] == "b")
+    dec_c = next(d for d in clean["decomposition"] if d["arm"] == "b")
+    assert dec_b == dec_c and dec_b["per_class"]
+    assert "a" in res["void"] and "b" in res["void"]
+    parities = {e["arm"]: e for e in res["ttft_parity"]}
+    assert parities["b"]["index_median"] == 0.0 and parities["a"]["index_median"] == 0.0
+    assert ttft_parity([a0, a1, a2, b0, b1, b2], exclude_void=False)[1]["index_values"] == [0.0, 0.0, 7.0]
+
+
 def test_ttft_parity_detects_reasoning_parser_mismatch():
     a = RunRef("a", 0, "", _summary(0.1, idx=0.0), meta={"source_config": {"workload_type": {"ttft_token": "any"}}})
     b = RunRef("b", 0, "", _summary(0.1, idx=2.0), meta={"source_config": {"workload_type": {"ttft_token": "content"}}})
@@ -301,7 +324,29 @@ async def test_arms_cli_dry_run_and_compare(openai_stub, tmp_path, monkeypatch):
     cli = CliRunner()
     r = cli.invoke(main, ["arms", str(cfg_path), "--out-dir", str(out), "--run-id", "dry", "--dry-run"])
     assert r.exit_code == 0, r.output
+    # no hooks on either arm: nothing to start/stop, so no markers or overlap note
     assert r.output.splitlines() == ["a rep-0", "b rep-0", "b rep-1", "a rep-1"]
+
+    # With hooks and relaunch: once, both servers are up during each other's
+    # reps (ABBA) — the dry run says so, and marks where the stop hooks run (#14).
+    cfg2 = json.loads(json.dumps(cfg))
+    cfg2["order"] = "abba"
+    cfg2["arms"]["arms"] = {"a": {"launch": "true", "stop": "true"},
+                            "b": {"launch": "true", "stop": "true",
+                                  "config": {"workload_type": {"model": "slow"}}}}
+    cfg_path.write_text(json.dumps(cfg2))
+    r = cli.invoke(main, ["arms", str(cfg_path), "--out-dir", str(out), "--run-id", "dry2", "--dry-run"])
+    assert r.exit_code == 0, r.output
+    assert r.output.splitlines() == [
+        "a rep-0", "b rep-0", "b rep-1  + stop", "a rep-1  + stop",
+        "⚠ a and b are both live at some point (relaunch once/once); use relaunch: visit or "
+        "every_rep if they share GPUs",
+    ]
+    cfg2["arms"]["arms"]["a"]["relaunch"] = "visit"
+    cfg_path.write_text(json.dumps(cfg2))
+    r = cli.invoke(main, ["arms", str(cfg_path), "--out-dir", str(out), "--run-id", "dry3", "--dry-run"])
+    assert r.output.splitlines() == ["a rep-0  + stop", "b rep-0", "b rep-1  + stop", "a rep-1  + stop"]
+    cfg_path.write_text(json.dumps(cfg))
 
     # the CLI owns its event loop; run it in a thread so the stub keeps serving
     r = await asyncio.to_thread(cli.invoke, main, ["arms", str(cfg_path), "--out-dir", str(out),

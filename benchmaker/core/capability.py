@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 
@@ -71,6 +71,9 @@ class VoidRule:
     ``at``: ``"start"``, ``"end"`` or ``"both"``. ``path``: dotted path into
     the snapshot (numeric segments index lists). ``op``: see :data:`OPS`.
     ``ignore_missing``: a missing path does not count as a violation.
+    ``endpoint``: only check this rule against that endpoint of an
+    ``endpoints:`` map (issue #15); a ``path`` of the form
+    ``endpoints.<model>.<rest>`` scopes the same way.
     """
 
     name: str
@@ -79,6 +82,7 @@ class VoidRule:
     value: Any = None
     at: str = "end"
     ignore_missing: bool = False
+    endpoint: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.op not in OPS:
@@ -131,26 +135,27 @@ def _is_empty(v: Any) -> bool:
     return v is None or v == "" or v == [] or v == {}
 
 
-def check_rule(rule: VoidRule, snapshot: Optional[dict]) -> Optional[dict]:
+def check_rule(rule: VoidRule, snapshot: Optional[dict],
+                endpoint: Optional[str] = None) -> Optional[dict]:
     """Evaluate one rule against one snapshot.
 
     Returns ``None`` when the rule holds (or is skipped), else a violation
     record. ``snapshot`` is the *fetch result* (``fetch_json`` output).
     """
     if snapshot is None:
-        return _violation(rule, None, "no snapshot")
+        return _violation(rule, None, "no snapshot", endpoint)
     if not snapshot.get("ok"):
-        return _violation(rule, None, f"snapshot unavailable: {snapshot.get('error')}")
+        return _violation(rule, None, f"snapshot unavailable: {snapshot.get('error')}", endpoint)
     doc = normalize_capability(snapshot.get("data"))
     found, actual = _lookup(doc, rule.path)
     if not found:
         if rule.ignore_missing:
             return None
-        return _violation(rule, None, "path missing")
+        return _violation(rule, None, "path missing", endpoint)
     ok, reason = _apply_op(rule.op, actual, rule.value)
     if ok:
         return None
-    return _violation(rule, actual, reason)
+    return _violation(rule, actual, reason, endpoint)
 
 
 def _apply_op(op: str, actual: Any, expected: Any) -> tuple[bool, Optional[str]]:
@@ -182,12 +187,63 @@ def _apply_op(op: str, actual: Any, expected: Any) -> tuple[bool, Optional[str]]
     return False, f"unknown op {op}"
 
 
+def _scope_rule(rule: VoidRule, endpoint: Optional[str],
+                endpoints: Optional[list[str]]) -> tuple[VoidRule, bool]:
+    """Resolve a rule's endpoint scope (issue #15): ``(rule, applies)``.
+
+    A rule is scoped by ``endpoint:`` or by a path prefixed
+    ``endpoints.<model>.``. An unscoped rule applies to every endpoint (and to
+    a single-endpoint run); a scoped one only to its endpoint, with the
+    prefix stripped from its path. Names are matched longest-first so model
+    names containing dots (``qwen2.5-7b``) resolve correctly."""
+    name = rule.endpoint
+    path = rule.path
+    if path.startswith("endpoints."):
+        for cand in sorted(endpoints or [], key=len, reverse=True):
+            prefix = f"endpoints.{cand}"
+            if path == prefix or path.startswith(prefix + "."):
+                name = cand
+                path = path[len(prefix):].lstrip(".")
+                break
+        else:
+            return rule, False  # names no configured endpoint (validate_rule_scopes rejects this)
+    if name is None:
+        return rule, True
+    if name != endpoint:
+        return rule, False
+    return (replace(rule, path=path) if path != rule.path else rule), True
+
+
+def validate_rule_scopes(rules: list[VoidRule], endpoints: Optional[list[str]]) -> None:
+    """Config-time check: a scoped rule must name a configured endpoint and
+    leave a path to evaluate (issue #15)."""
+    names = list(endpoints or [])
+    for rule in rules:
+        if rule.endpoint is not None and rule.endpoint not in names:
+            raise ValueError(f"void rule {rule.name!r}: endpoint {rule.endpoint!r} is not in endpoints {names}")
+        if not rule.path.startswith("endpoints."):
+            continue
+        for cand in sorted(names, key=len, reverse=True):
+            prefix = f"endpoints.{cand}"
+            if rule.path == prefix or rule.path.startswith(prefix + "."):
+                if rule.endpoint is not None and rule.endpoint != cand:
+                    raise ValueError(f"void rule {rule.name!r}: endpoint {rule.endpoint!r} "
+                                     f"but path {rule.path!r} names {cand!r}")
+                if not rule.path[len(prefix):].lstrip("."):
+                    raise ValueError(f"void rule {rule.name!r}: path {rule.path!r} names the endpoint "
+                                     "but no field of its snapshot")
+                break
+        else:
+            raise ValueError(f"void rule {rule.name!r}: path {rule.path!r} names no configured endpoint {names}")
+
+
 def _violation(rule: VoidRule, actual: Any, reason: str, endpoint: Optional[str] = None) -> dict:
     v = {
         "rule": rule.name, "at": rule.at, "path": rule.path, "op": rule.op,
         "expected": rule.value, "actual": actual, "reason": reason,
     }
     if endpoint is not None:
+        v["path"] = f"endpoints.{endpoint}.{rule.path}"
         v["endpoint"] = endpoint
     return v
 
@@ -207,26 +263,30 @@ class VoidVerdict:
 
 
 def evaluate_void_rules(rules: list[VoidRule], start: Optional[dict],
-                        end: Optional[dict], *, endpoint: Optional[str] = None) -> VoidVerdict:
+                        end: Optional[dict], *, endpoint: Optional[str] = None,
+                        endpoints: Optional[list[str]] = None) -> VoidVerdict:
     """Evaluate every rule at its declared snapshot(s). With an ``endpoint``
     name (issue #8) every check and violation records which endpoint it was
-    read from."""
+    read from and prefixes its path with ``endpoints.<model>.``; a rule
+    scoped to another endpoint is skipped (issue #15, see :func:`_scope_rule`)."""
     verdict = VoidVerdict()
     for rule in rules:
+        scoped, applies = _scope_rule(rule, endpoint, endpoints)
+        if not applies:
+            continue
         for at, snap in (("start", start), ("end", end)):
-            if rule.at not in (at, "both"):
+            if scoped.at not in (at, "both"):
                 continue
-            v = check_rule(rule, snap)
-            if v is not None and rule.at == "both":
+            v = check_rule(scoped, snap, endpoint=endpoint)
+            if v is not None and scoped.at == "both":
                 v["at"] = at  # which of the two snapshots violated
             check = {
-                "rule": rule.name, "at": at, "path": rule.path, "op": rule.op,
-                "expected": rule.value, "ok": v is None,
+                "rule": scoped.name, "at": at, "path": scoped.path, "op": scoped.op,
+                "expected": scoped.value, "ok": v is None,
             }
             if endpoint is not None:
+                check["path"] = f"endpoints.{endpoint}.{scoped.path}"
                 check["endpoint"] = endpoint
-                if v is not None:
-                    v.setdefault("endpoint", endpoint)
             verdict.checks.append(check)
             if v is not None:
                 verdict.violations.append(v)

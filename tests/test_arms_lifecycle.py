@@ -11,7 +11,7 @@ import pytest
 import pytest_asyncio
 from aiohttp import web
 
-from benchmaker.core.arms import ArmSpec, ArmsRunner, evaluate_check, normalize_check, run_hook, stops_after
+from benchmaker.core.arms import ArmSpec, ArmsRunner, evaluate_check, live_overlaps, normalize_check, run_hook, stops_after
 from benchmaker.io.bundle import read_bundle
 
 
@@ -92,9 +92,19 @@ def test_stops_after_follows_relaunch_mode():
     arm_visit = ArmSpec(name="a", relaunch="visit")
     arm_rep = ArmSpec(name="a", relaunch="every_rep")
     plan = [(0, "a"), (0, "b"), (1, "b"), (1, "a")]  # abba
-    assert [stops_after(arm_visit, plan, i) for i in range(4)] == [True, False, True, True]
-    assert not any(stops_after(arm_once, plan, i) for i in range(4))
-    assert all(stops_after(arm_rep, plan, i) for i in range(4))
+    # Asked at an arm's own entries (arm "a" here: indices 0 and 3).
+    assert [stops_after(arm_visit, plan, i) for i in (0, 3)] == [True, True]
+    assert [stops_after(arm_rep, plan, i) for i in (0, 3)] == [True, True]
+    # once: up across the whole plan, torn down after its last entry so the
+    # stop hook (and its post_stop_check) run in plan order (#14)
+    assert [stops_after(arm_once, plan, i) for i in (0, 3)] == [False, True]
+    # Asked at the other arm's entries (arm "b", also `visit`: stops before a restarts)
+    assert [stops_after(arm_visit, plan, i) for i in (1, 2)] == [False, True]
+    # Both-up overlaps: only `once` (and only for arms the runner manages)
+    a1 = ArmSpec(name="a", relaunch="once", stop="true")
+    assert live_overlaps(plan, {"a": a1, "b": ArmSpec(name="b", relaunch="once", stop="true")}) == [("a", "b")]
+    assert live_overlaps(plan, {"a": arm_visit, "b": ArmSpec(name="b", relaunch="visit", stop="true")}) == []
+    assert live_overlaps(plan, {"a": ArmSpec(name="a", relaunch="visit"), "b": ArmSpec(name="b")}) == []
 
 
 def test_run_hook_records_exit_output_and_timeouts(tmp_path):
@@ -187,7 +197,7 @@ async def test_once_relaunch_stops_at_end_and_records_hooks(openai_stub, tmp_pat
     await runner.run_async()
     root = tmp_path / "out" / "r"
     assert _hook_events(root, "a", "launch") == ["launch-rep-0.log"]
-    assert _hook_events(root, "a", "stop") == ["stop-final.log"]
+    assert _hook_events(root, "a", "stop") == ["stop-rep-1.log"]  # in plan order, after the last entry
     for rep in (0, 1):
         hooks = _meta(root, "a", rep)["hooks"]
         assert hooks["start"]["exit_code"] == 0 and hooks["stop"]["exit_code"] == 0
@@ -229,7 +239,8 @@ async def test_failed_post_stop_check_voids_the_launch(openai_stub, tmp_path, mo
     for rep in (0, 1):
         b = read_bundle(str(root / "arms" / "a" / f"rep-{rep}"))
         assert b["meta"]["void"] is True
-        assert [v["rule"] for v in b["meta"]["void_violations"]] == ["post_stop_check"]
+        # a failed stop hook voids the launch too (#14), and so does its failed check
+        assert [v["rule"] for v in b["meta"]["void_violations"]] == ["stop", "post_stop_check"]
         assert b["summary"]["void"]["void"] is True
         assert b["meta"]["hooks"]["stop"]["exit_code"] == 2 and b["meta"]["hooks"]["stop"]["ok"] is False
         assert b["meta"]["hooks"]["post_stop_check"]["ok"] is False

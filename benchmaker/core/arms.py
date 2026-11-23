@@ -17,6 +17,7 @@ every arm equally. The YAML shape::
       launch_timeout_s: 600  # start hook timeout
       ready_timeout_s: 600   # ready_check polling budget
       stop_timeout_s: 120    # stop hook timeout
+      stop_failure_voids: true  # a failed stop hook voids every rep of its launch (issue #14)
       arms:
         rill:
           config: {workload_type: {url: "http://rill:8000/v1/chat/completions"}}
@@ -62,6 +63,7 @@ import os
 import random
 import signal
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -88,6 +90,8 @@ ORDERS = ("abba", "rep-major", "random")
 RELAUNCH_MODES = ("once", "every_rep", "visit")
 DEFAULT_INTERVAL_S = 2.0
 OUTPUT_TAIL_CHARS = 2048
+HOOK_POLL_S = 0.25          # how often a running hook is checked for cancellation
+HOOK_CANCEL_GRACE_S = 30.0  # how long teardown waits for an interrupted start hook to die
 
 
 @dataclass
@@ -110,6 +114,12 @@ class ArmSpec:
     # ``endpoints``: per-model server map (#8), merged into the arm's config.
     endpoints: dict = field(default_factory=dict)
     labels: dict = field(default_factory=dict)
+
+    @property
+    def managed(self) -> bool:
+        """Whether the runner starts/stops this arm's server itself (it has a
+        start or stop hook). An unmanaged arm is served from outside."""
+        return bool(self.start or self.stop)
 
     @classmethod
     def from_dict(cls, name: str, d: Any) -> "ArmSpec":
@@ -144,6 +154,7 @@ class ArmsSettings:
     ready_timeout_s: float = 600.0
     stop_timeout_s: float = 120.0
     check_timeout_s: float = 60.0
+    stop_failure_voids: bool = True
     arms: list[ArmSpec] = field(default_factory=list)
 
 
@@ -177,6 +188,7 @@ def parse_arms_config(cfg: dict) -> tuple[dict, ArmsSettings]:
         ready_timeout_s=float(spec.get("ready_timeout_s", 600)),
         stop_timeout_s=float(spec.get("stop_timeout_s", 120)),
         check_timeout_s=float(spec.get("check_timeout_s", 60)),
+        stop_failure_voids=bool(spec.get("stop_failure_voids", True)),
         arms=[ArmSpec.from_dict(name, d) for name, d in arms_spec.items()],
     )
     if settings.reps < 1:
@@ -260,17 +272,22 @@ def _tail(path: str, limit: int = OUTPUT_TAIL_CHARS) -> str:
 
 
 def run_hook(command: str, *, arm: str, rep: Optional[int], env: dict[str, str],
-             log_path: str, timeout_s: float) -> dict:
+             log_path: str, timeout_s: float,
+             cancel: Optional[threading.Event] = None) -> dict:
     """Run a shell hook synchronously and return its record (issue #9):
-    ``{command, exit_code, timed_out, error, duration_s, log, output_tail}``.
+    ``{command, exit_code, timed_out, cancelled, error, duration_s, log, output_tail}``.
     Never raises for a failing hook — the caller decides what a non-zero exit
     means. ``BENCHMAKER_ARM`` / ``BENCHMAKER_REP`` are exported to the hook
-    along with the arm's ``env``."""
+    along with the arm's ``env``.
+
+    ``cancel`` (issue #14): the process is reaped in short waits so a set
+    event — the run was interrupted while the hook ran — kills its whole
+    process group promptly instead of after ``timeout_s``."""
     full_env = {**os.environ, **env, "BENCHMAKER_ARM": arm}
     if rep is not None:
         full_env["BENCHMAKER_REP"] = str(rep)
     rec: dict[str, Any] = {"command": command, "exit_code": None, "timed_out": False,
-                           "error": None, "duration_s": None, "log": log_path}
+                           "cancelled": False, "error": None, "duration_s": None, "log": log_path}
     t0 = time.monotonic()
     try:
         with open(log_path, "w") as log:
@@ -278,12 +295,24 @@ def run_hook(command: str, *, arm: str, rep: Optional[int], env: dict[str, str],
                 command, shell=True, env=full_env, stdout=log,
                 stderr=subprocess.STDOUT, cwd=os.getcwd(), start_new_session=True)
             try:
-                proc.wait(timeout=timeout_s)
-                rec["exit_code"] = proc.returncode
-            except subprocess.TimeoutExpired:
-                rec["timed_out"] = True
-                rec["error"] = f"timed out after {timeout_s:.0f}s"
-                _kill_tree(proc)
+                deadline = t0 + timeout_s
+                while True:
+                    slice_s = max(deadline - time.monotonic(), 0.01)
+                    try:
+                        proc.wait(timeout=min(HOOK_POLL_S, slice_s))
+                        rec["exit_code"] = proc.returncode
+                        break
+                    except subprocess.TimeoutExpired:
+                        if cancel is not None and cancel.is_set():
+                            rec["cancelled"] = True
+                            rec["error"] = "cancelled (run interrupted)"
+                            _kill_tree(proc)
+                            break
+                        if time.monotonic() >= deadline:
+                            rec["timed_out"] = True
+                            rec["error"] = f"timed out after {timeout_s:.0f}s"
+                            _kill_tree(proc)
+                            break
             except BaseException:
                 _kill_tree(proc)
                 raise
@@ -382,15 +411,43 @@ def stops_after(arm: ArmSpec, plan: list[tuple[int, str]], index: int) -> bool:
     * ``every_rep``: after every rep.
     * ``visit``: when the next entry is another arm (or there is none), so in
       ABBA order the GPUs are free before the other arm starts.
-    * ``once``: never here — the runner stops it in its ``finally``.
+    * ``once``: after the arm's last entry in the plan, so the stop hook
+      runs in plan order rather than only in the runner's ``finally`` (and
+      a failing one voids that launch, issue #14); before then never — the
+      launch stays up across the other arm's reps.
     """
-    rep, name = plan[index]
+    name = plan[index][1]
     if arm.relaunch == "every_rep":
         return True
     if arm.relaunch == "visit":
         nxt = plan[index + 1][1] if index + 1 < len(plan) else None
         return nxt != name
-    return False
+    return name not in {n for _, n in plan[index + 1:]}
+
+
+def live_overlaps(plan: list[tuple[int, str]], arms: dict[str, ArmSpec]) -> list[tuple[str, str]]:
+    """Pairs of arms whose launches are both up at the same time under the
+    plan and the arms' ``relaunch`` modes (issue #14): with ``once`` (or no
+    hooks at all) A's launch is still up while B's reps run, so two servers
+    share the node's GPUs and each arm's numbers include the other's load.
+    Repeated pairs are reported once; order is first-seen."""
+    live: dict[str, int] = {}
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for i, (rep, name) in enumerate(plan):
+        arm = arms.get(name) or ArmSpec(name=name)
+        if not arm.managed:
+            continue  # no hooks: managed outside the runner, never "live" here
+        for other in live:
+            if other != name:
+                key = (other, name) if other < name else (name, other)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(key)
+        live[name] = rep
+        if stops_after(arm, plan, i):
+            live.pop(name, None)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -424,6 +481,8 @@ class ArmsRunner:
         self.launched: set[str] = set()          # arms that were ever started (compat)
         self.launch_hooks: dict[str, dict] = {}
         self.launch_bundles: dict[str, list[str]] = {}
+        self.launch_ready_violation: dict[str, Optional[dict]] = {}  # per launch (#14)
+        self._hooks_in_flight: dict[str, tuple[threading.Event, threading.Event]] = {}  # (cancel, done)
         self.log_lines: list[str] = []
 
     # -- helpers ----------------------------------------------------------
@@ -456,34 +515,58 @@ class ArmsRunner:
     # -- lifecycle (#9) -----------------------------------------------------
     async def _start(self, arm: ArmSpec, rep: int) -> list[dict]:
         """Bring the arm up for ``rep`` if it is not live. Returns void
-        violations (a failed ``ready_check``). A start hook that exits non-zero
-        is fatal: the launch is torn down and the run aborted. Hooks and
-        checks run in a worker thread so the event loop stays alive."""
+        violations: a failed ``ready_check`` voids *every* rep of this launch
+        (issue #14), so it is returned again for each later rep that reuses
+        the launch. A start hook that exits non-zero is fatal: the launch is
+        torn down and the run aborted. Hooks and checks run in a worker
+        thread so the event loop stays alive."""
         import asyncio
 
         if arm.name in self.live:
-            return []
+            v = self.launch_ready_violation.get(arm.name)
+            return [{**v, "rep": rep}] if v else []
         hooks: dict[str, Any] = {}
         s = self.settings
         if arm.start:
-            rec = await asyncio.to_thread(
-                run_hook, arm.start, arm=arm.name, rep=rep, env=arm.env,
-                log_path=self._hook_log(arm, "launch", rep), timeout_s=s.launch_timeout_s)
+            # The launch counts as live *before* the hook runs (issue #14):
+            # Ctrl-C while it runs lands in run_async's finally, which
+            # cancels the hook (_hooks_in_flight) and runs the stop hook.
+            self.live[arm.name] = rep
+            self.launch_bundles[arm.name] = []
+            cancel, done = threading.Event(), threading.Event()
+            self._hooks_in_flight[arm.name] = (cancel, done)
+            log_path = self._hook_log(arm, "launch", rep)
+
+            def _run() -> dict:
+                try:
+                    return run_hook(arm.start, arm=arm.name, rep=rep, env=arm.env, log_path=log_path,
+                                    timeout_s=s.launch_timeout_s, cancel=cancel)
+                finally:
+                    done.set()
+
+            try:
+                rec = await asyncio.to_thread(_run)
+            except BaseException as e:
+                # On CancelledError the thread keeps running: leave the entry
+                # so teardown can cancel it; otherwise it has finished.
+                if not isinstance(e, asyncio.CancelledError):
+                    self._hooks_in_flight.pop(arm.name, None)
+                raise
+            self._hooks_in_flight.pop(arm.name, None)
             hooks["start"] = rec
             self._say(f"[arms] starting {arm.name}: {arm.start} -> exit {rec['exit_code']} "
                       f"in {rec['duration_s']:.1f}s ({rec['log']})")
             if rec["exit_code"] != 0:
                 self._say(f"[arms] start hook for {arm.name} failed; running stop hook before aborting")
-                self.live[arm.name] = rep
                 self.launch_hooks[arm.name] = hooks
-                self.launch_bundles[arm.name] = []
                 await self._stop(arm, rep)
                 raise RuntimeError(f"start hook for arm {arm.name!r} failed (exit {rec['exit_code']}); "
                                    f"see {rec['log']}")
         self.live[arm.name] = rep
         self.launched.add(arm.name)
-        self.launch_bundles[arm.name] = []
+        self.launch_bundles.setdefault(arm.name, [])
         violations: list[dict] = []
+        self.launch_ready_violation[arm.name] = None
         if arm.ready_check:
             spec = normalize_check(arm.ready_check, default_timeout_s=s.ready_timeout_s)
             rec = await asyncio.to_thread(
@@ -494,21 +577,46 @@ class ArmsRunner:
             if rec["ok"]:
                 self._say(f"[arms] {arm.name} ready after {rec['elapsed_s']:.1f}s")
             else:
-                self._warn(f"[arms] {arm.name} NOT ready: {rec['error']} -> rep-{rep} is void")
-                violations.append(hook_violation("ready_check", rec["error"], arm=arm.name, rep=rep))
+                self._warn(f"[arms] {arm.name} NOT ready: {rec['error']} -> every rep of this "
+                           f"launch is void (issue #14)")
+                v = hook_violation("ready_check", rec["error"], arm=arm.name, rep=rep, launch_rep=rep)
+                violations.append(v)
+                self.launch_ready_violation[arm.name] = v
         self.launch_hooks[arm.name] = hooks
         return violations
+
+    async def _cancel_in_flight(self, name: str) -> None:
+        """Ask a still-running start hook to stop and wait (bounded) for its
+        thread, so the stop hook does not race the launcher it precludes."""
+        import asyncio
+
+        entry = self._hooks_in_flight.get(name)
+        if entry is None:
+            return
+        cancel, done = entry
+        if not done.is_set():
+            cancel.set()
+            self._warn(f"[arms] interrupting {name}'s start hook (still running; issue #14)")
+            await asyncio.to_thread(done.wait, HOOK_CANCEL_GRACE_S)
+        if done.is_set():
+            self._hooks_in_flight.pop(name, None)
+        else:
+            self._warn(f"[arms] start hook for {name} did not stop within {HOOK_CANCEL_GRACE_S:.0f}s")
 
     async def _stop(self, arm: ArmSpec, rep: int, *, final: bool = False) -> list[dict]:
         """Tear the launch down: stop hook (with ``stop_timeout_s``), then
         ``post_stop_check``. Returns void violations, which are applied to
-        every bundle written under this launch."""
+        every bundle written under this launch. A stop hook that fails (or
+        times out) is one of them unless ``arms.stop_failure_voids`` is off
+        (issue #14)."""
         import asyncio
 
         if arm.name not in self.live:
             return []
         s = self.settings
+        await self._cancel_in_flight(arm.name)
         hooks: dict[str, Any] = {}
+        violations: list[dict] = []
         if arm.stop:
             rec = await asyncio.to_thread(
                 run_hook, arm.stop, arm=arm.name, rep=rep, env=arm.env,
@@ -521,7 +629,12 @@ class ArmsRunner:
                 self._warn(f"[arms] stop hook for {arm.name} failed: exit {rec['exit_code']} "
                            f"{rec['error'] or ''} (see {rec['log']})")
                 hooks["stop"]["ok"] = False
-        violations: list[dict] = []
+                if s.stop_failure_voids:
+                    self._warn(f"[arms] voiding {len(self.launch_bundles.get(arm.name) or [])} rep(s) "
+                               f"of {arm.name}'s launch (arms.stop_failure_voids)")
+                    violations.append(hook_violation(
+                        "stop", f"exit {rec['exit_code']} {rec['error'] or ''}".strip(),
+                        arm=arm.name, rep=rep))
         if arm.post_stop_check:
             spec = normalize_check(arm.post_stop_check, default_timeout_s=s.check_timeout_s)
             rec = await asyncio.to_thread(
@@ -539,6 +652,7 @@ class ArmsRunner:
         self.live.pop(arm.name, None)
         self.launch_hooks.pop(arm.name, None)
         self.launch_bundles.pop(arm.name, None)
+        self.launch_ready_violation.pop(arm.name, None)
         return violations
 
     def _apply_to_launch(self, arm: ArmSpec, hooks: dict, violations: list[dict]) -> None:
@@ -556,8 +670,13 @@ class ArmsRunner:
 
     async def _stop_all(self) -> None:
         """Tear every live launch down — the ``finally`` of the run, so
-        failures and interrupts never leave a server behind."""
+        failures and interrupts never leave a server behind. Start hooks
+        still running are cancelled first (issue #14) so they cannot restart
+        a server after its stop hook ran."""
         arms = {a.name: a for a in self.settings.arms}
+        for cancel, done in list(self._hooks_in_flight.values()):
+            if not done.is_set():
+                cancel.set()
         for name in list(self.live):
             arm = arms.get(name)
             if arm is None:
@@ -582,15 +701,24 @@ class ArmsRunner:
         s = self.settings
         names = [a.name for a in s.arms]
         plan = plan_order(names, s.reps, s.order, s.seed)
+        arms_by_name = {a.name: a for a in s.arms}
+        overlaps = live_overlaps(plan, arms_by_name)
+        for a, b in overlaps:
+            self._warn(f"[arms] arms {a!r} and {b!r} will both be live at the same time "
+                       f"(relaunch {arms_by_name[a].relaunch}/{arms_by_name[b].relaunch}): if they share "
+                       f"GPUs, use relaunch: visit or every_rep so each is torn down before the "
+                       f"other starts (issue #14)")
         os.makedirs(self.root, exist_ok=True)
         with open(os.path.join(self.root, "plan.json"), "w") as f:
             json.dump({"order": s.order, "reps": s.reps, "warmup_reps": s.warmup_reps,
-                       "seed": s.seed, "plan": [{"arm": a, "rep": r} for r, a in plan]},
+                       "seed": s.seed, "plan": [{"arm": a, "rep": r} for r, a in plan],
+                       "stops_after": [{"arm": a, "rep": r, "stop": stops_after(arms_by_name[a], plan, i)}
+                                       for i, (r, a) in enumerate(plan)],
+                       "overlaps": [{"arm": a, "other": b} for a, b in overlaps]},
                       f, indent=2)
         self._say(f"[arms] {len(names)} arms x {s.reps} reps, order={s.order}, "
                   f"warmup_reps={s.warmup_reps} -> {len(plan)} runs")
 
-        arms_by_name = {a.name: a for a in s.arms}
         t_all = time.monotonic()
         try:
             for i, (rep, name) in enumerate(plan, 1):
@@ -654,13 +782,15 @@ def build_comparison(runs: list[RunRef], settings: ArmsSettings) -> dict:
     result["ttft_parity"] = parity
     result["ttft_parity_warnings"] = ttft_parity_warnings(parity)
     # TTFT mix/latency decomposition vs the reference (#2), only when the
-    # runs carry per-class groups.
-    ref_runs = [r for r in runs if r.arm == result["reference"] and not r.warmup]
+    # runs carry per-class groups. Void reps are excluded like warm-up ones
+    # (issue #17): a rep voided for a failed readiness check would otherwise
+    # weigh on the medians the decomposition attributes to the arm.
+    ref_runs = [r for r in runs if r.arm == result["reference"] and not r.warmup and not r.is_void()]
     decs = []
     for arm in result["arms"]:
         if arm == result["reference"]:
             continue
-        a_runs = [r for r in runs if r.arm == arm and not r.warmup]
+        a_runs = [r for r in runs if r.arm == arm and not r.warmup and not r.is_void()]
         if not a_runs or not ref_runs:
             continue
         try:
@@ -744,10 +874,14 @@ def _median_summary(summaries: list[dict], metric: str = "workload_metrics.ttft_
             if m is not None:
                 means.setdefault(cls, []).append(float(m))
     groups = {}
-    parent, leaf = metric.rsplit(".", 1)
+    parts = metric.split(".")
     for cls in shares:
-        groups[cls] = {
-            "share": sorted(shares[cls])[len(shares[cls]) // 2],
-            parent: {leaf: (sorted(means[cls])[len(means[cls]) // 2] if cls in means else 0.0)},
-        }
+        med = sorted(means[cls])[len(means[cls]) // 2] if cls in means else 0.0
+        # nest the metric path (``workload_metrics.ttft_s.mean``) so that
+        # ``dotted_get`` finds it — a literal dotted key was never found, and
+        # the decomposition was silently skipped whenever an arm had >= 2 reps
+        leaf: dict = {parts[-1]: med}
+        for part in reversed(parts[:-1]):
+            leaf = {part: leaf}
+        groups[cls] = {"share": sorted(shares[cls])[len(shares[cls]) // 2], **leaf}
     return {"groups": {key: groups}}

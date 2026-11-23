@@ -64,6 +64,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import statistics
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Union
@@ -336,6 +337,9 @@ class _StreamStats:
     token_arrival_times: list = field(default_factory=list)
     token_kinds: list = field(default_factory=list)
     usage_completion_tokens: Optional[int] = None
+    # Tokens carried by each streamed event (exact, from a server that reports
+    # cumulative completion_tokens per event — sglang); index 0 unused.
+    tokens_per_event: Optional[list] = None
     reasoning_tokens: Optional[int] = None
     prompt_tokens: Optional[int] = None
     cached_tokens: Optional[int] = None
@@ -506,15 +510,33 @@ def finish_llm_sample(sample: Sample, request: Request, response: Response, st: 
         sample.extra["content_ttft_s"] = first_content_token
 
     if len(token_arrival_times) >= 2:
-        itl = [
-            (token_arrival_times[i] - token_arrival_times[i - 1]) * 1000.0
-            for i in range(1, len(token_arrival_times))
-        ]
-        sample.extra["itl_ms_mean"] = statistics.mean(itl)
-        sample.extra["itl_ms_p50"] = _pct(itl, 50)
-        sample.extra["itl_ms_p99"] = _pct(itl, 99)
-        # Raw gaps: pooled across requests by the summary (issue #1).
-        sample.series[ITL_SERIES] = itl
+        # Per-token gaps (issue #17): the server's own token counts (usage, or
+        # per-event cumulative counts) decide how many tokens each event
+        # carried, and a burst of events read together splits its gap.
+        gaps = token_gaps(
+            token_arrival_times, st.tokens_per_event,
+            completion_tokens=st.usage_completion_tokens if st.usage_seen else None)
+        itl = gaps["itl_ms"]
+        if itl:
+            sample.extra["itl_ms_mean"] = statistics.mean(itl)
+            sample.extra["itl_ms_p50"] = _pct(itl, 50)
+            sample.extra["itl_ms_p99"] = _pct(itl, 99)
+            # Raw gaps: pooled across requests by the summary (issue #1).
+            sample.series[ITL_SERIES] = itl
+        sample.meta["itl_mode"] = gaps["mode"]
+        if gaps.get("usage_mismatch"):
+            sample.meta["itl_usage_mismatch"] = True
+        # The per-event (per network read) gaps the headline used to be: kept
+        # next to it so a change in event batching is visible, not hidden.
+        chunk = gaps["itl_chunk_ms"]
+        if chunk:
+            sample.extra["itl_chunk_ms_mean"] = statistics.mean(chunk)
+            sample.extra["itl_chunk_ms_p50"] = _pct(chunk, 50)
+            sample.extra["itl_chunk_ms_p99"] = _pct(chunk, 99)
+        sample.extra["itl_coalesced_events"] = float(gaps["coalesced_events"])
+        kpe = gaps["tokens_per_event"]
+        if kpe:
+            sample.extra["itl_tokens_per_event_mean"] = statistics.mean(kpe)
 
     sample.extra["tokens_out"] = float(completion_tokens)
     # Surface the reasoning/content breakdown from `usage` when the server
@@ -578,10 +600,94 @@ def finish_llm_sample(sample: Sample, request: Request, response: Response, st: 
     return sample
 
 # --------------------------------------------------------------------------- #
+# Inter-token latency (issue #17)                                             #
+# --------------------------------------------------------------------------- #
+
+# Events closer together than this arrived in one network read (or in a burst
+# the client only saw once): the gap is split over the read's tokens.
+ITL_BURST_GAP_S = 2e-4
+
+
+def token_gaps(arrivals: list[float], tokens_per_event: Optional[list] = None, *,
+               completion_tokens: Optional[int] = None,
+               burst_gap_s: float = ITL_BURST_GAP_S) -> dict:
+    """Per-token inter-token latency from the arrival times of streamed events.
+
+    ``arrivals``: monotonic arrival times (s) of the token-bearing events.
+    How many tokens each event carried —
+
+    * ``tokens_per_event``: exactly (sglang's cumulative ``completion_tokens``
+      per event; index 0 unused);
+    * else the final ``usage.completion_tokens``: fewer tokens than events
+      means the usage undercounts (reasoning tokens not included, say) and
+      each event stays one token; more means the server batched tokens per
+      event and the surplus is spread evenly (``mode = per_token_estimated``);
+    * else one token per event (``mode = per_event`` — the client cannot know
+      whether an event carried several tokens).
+
+    Consecutive events within ``burst_gap_s`` of their burst's first event
+    came in one read; the gap to the previous burst is divided by the burst's
+    token count instead of landing whole on its first token. ``itl_chunk_ms``
+    keeps the plain per-event gaps for comparison.
+
+    Returns ``{"itl_ms", "itl_chunk_ms", "mode", "tokens_per_event",
+    "coalesced_events", "burst_gap_s" [, "usage_mismatch"]}``.
+    """
+    n = len(arrivals)
+    out: dict = {"itl_ms": [], "itl_chunk_ms": [], "mode": "per_event",
+                 "tokens_per_event": [1] * n, "coalesced_events": 0, "burst_gap_s": burst_gap_s}
+    if n < 2:
+        return out
+    k = [1] * n
+    exact = None
+    if tokens_per_event is not None and len(tokens_per_event) == n:
+        exact = [max(int(x), 0) for x in tokens_per_event]
+        if sum(exact[1:]) <= 0:  # counts never advanced: no information
+            exact = None
+    if exact is not None:
+        k = exact
+        out["mode"] = "per_token"
+    elif completion_tokens is not None:
+        if completion_tokens >= n:
+            base, rem = divmod(int(completion_tokens), n)
+            k = [base + (1 if i < rem else 0) for i in range(n)]
+            out["mode"] = "per_token" if completion_tokens == n else "per_token_estimated"
+        else:
+            out["mode"] = "per_token"
+            out["usage_mismatch"] = True
+    out["tokens_per_event"] = k
+    out["itl_chunk_ms"] = [(arrivals[i] - arrivals[i - 1]) * 1000.0 for i in range(1, n)]
+    # Group events into bursts (reads).
+    groups: list[tuple[float, int]] = []  # (first arrival, tokens in the burst)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and arrivals[j + 1] - arrivals[i] <= burst_gap_s:
+            j += 1
+        groups.append((arrivals[i], sum(k[i:j + 1])))
+        i = j + 1
+    out["coalesced_events"] = n - len(groups)
+    gaps: list[float] = []
+    pending_ms = 0.0
+    for g in range(1, len(groups)):
+        gap_ms = (groups[g][0] - groups[g - 1][0]) * 1000.0 + pending_ms
+        pending_ms = 0.0
+        tokens = groups[g][1]
+        if tokens <= 0:
+            pending_ms = gap_ms  # an event that carried no tokens: its time goes to the next
+            continue
+        gaps.extend([gap_ms / tokens] * tokens)
+    if pending_ms and gaps:
+        gaps[-1] += pending_ms
+    out["itl_ms"] = gaps
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Cache classification (issue #2)                                             #
 # --------------------------------------------------------------------------- #
 
-CACHE_CLASSES = ("device_hit", "restore", "partial", "miss")
+CACHE_CLASSES = ("device_hit", "restore", "partial", "miss", "unknown")
 
 # Keys (usage block, prompt_tokens_details, response headers) a server may use
 # to say which tier served the cached prefix. Checked case-insensitively for
@@ -635,12 +741,18 @@ def classify_cache(info: CacheClassInfo, full_hit_ratio: float = 0.9) -> Optiona
 
     * ``miss``     — nothing was cached.
     * ``restore``  — the server said the cached prefix was (partly) restored
-                     from a remote/host tier: a ``cache_hint`` naming a
-                     restore/remote/host tier, or ``restored_tokens > 0``.
+                     from a remote/host tier: ``restored_tokens > 0``, or a
+                     ``cache_hint`` naming a restore tier (restore words win
+                     over device words: a hint such as ``host_dram`` must not
+                     read as a device hit, issue #17).
     * ``device_hit`` — cached tokens cover at least ``full_hit_ratio`` of the
-                     prompt and no restore was involved: the prefix cache
-                     did its whole job from the device.
+                     prompt, no restore was involved, and the hint (if any)
+                     names a device tier or no tier at all.
     * ``partial``  — some tokens cached, below the full-hit ratio.
+    * ``unknown``  — a full hit by ratio whose hint names neither kind of
+                     tier (a vocabulary this module does not know): recorded
+                     as such rather than guessed ``device_hit`` (issue #17);
+                     plug a ``cache_classifier`` for the server's vocabulary.
 
     The ratio is a heuristic: a hit that stops short of the prompt is usually
     the genuinely new suffix (the new turn), which is why it is configurable.
@@ -650,23 +762,55 @@ def classify_cache(info: CacheClassInfo, full_hit_ratio: float = 0.9) -> Optiona
         return None
     if info.cached_tokens <= 0 and not (info.restored_tokens or 0):
         return "miss"
-    if info.restored_tokens or (info.hint and _hint_is_restore(info.hint)):
+    tier = hint_tier(info.hint)
+    if info.restored_tokens or tier == "restore":
         return "restore"
-    if info.cached_ratio >= full_hit_ratio:
-        return "device_hit"
-    return "partial"
+    if info.cached_ratio < full_hit_ratio:
+        return "partial"
+    return "unknown" if tier == "unknown" else "device_hit"
 
 
-_RESTORE_WORDS = ("restore", "remote", "host", "cpu", "kvstore", "store", "mooncake", "lmcache", "hicache")
-_DEVICE_WORDS = ("device", "gpu", "hbm", "local", "dram", "vram")
+# Tier vocabularies a server may use in ``cache_source`` / ``cache_tier`` /
+# ``X-Cache-Source``. Matched as whole words — ``host_dram``, ``HostDram``,
+# ``HOST-DRAM`` all split into words — so ``dram`` (host memory) is a restore
+# tier, only ``hbm`` / ``gpu`` / ``device`` / ``local`` / ``vram`` are device
+# tiers, and ``localhost`` does not read as ``local``. Extend them (or plug a
+# ``cache_classifier``) for a server with its own vocabulary; a hint with no
+# word from either list is ``unknown`` (issue #17).
+RESTORE_WORDS = frozenset({
+    "restore", "restored", "restoration", "remote", "host", "cpu", "dram", "kvstore",
+    "store", "mooncake", "lmcache", "hicache", "ssd", "nvme", "disk", "peer", "mixed",
+    "offload", "memory", "transfer",
+})
+DEVICE_WORDS = frozenset({"device", "gpu", "hbm", "local", "vram", "devicekv"})
+# Values that carry no tier information at all.
+NO_TIER_HINTS = frozenset({"", "none", "unknown", "n/a", "na", "null"})
+_WORD_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[a-z]+|\d+")
+
+
+def hint_words(hint: str) -> set[str]:
+    """Lower-cased words of a hint: ``host_dram``/``HostDram``/``HOST-DRAM`` -> ``{host, dram}``."""
+    return {w.lower() for w in _WORD_RE.findall(hint)}
+
+
+def hint_tier(hint: Optional[str]) -> Optional[str]:
+    """``"restore"`` | ``"device"`` | ``"unknown"`` | ``None``: which kind of
+    tier a cache-source hint names (``None``: the hint says nothing, e.g.
+    ``none``). Restore words win over device words — a ``host_dram`` hit must
+    never read as a device hit (issue #17)."""
+    if hint is None or str(hint).strip().lower() in NO_TIER_HINTS:
+        return None
+    words = hint_words(str(hint))
+    if words & RESTORE_WORDS:
+        return "restore"
+    if words & DEVICE_WORDS:
+        return "device"
+    return "unknown"
 
 
 def _hint_is_restore(hint: str) -> bool:
-    """A hint names a restore tier if it mentions one and not a device tier."""
-    h = hint.lower()
-    if any(w in h for w in _DEVICE_WORDS):
-        return False
-    return any(w in h for w in _RESTORE_WORDS)
+    """A hint names a restore tier (kept for callers that predate :func:`hint_tier`)."""
+    return hint_tier(hint) == "restore"
 
 
 def _first_index(times: list[float], t: float) -> Optional[int]:
