@@ -426,6 +426,17 @@ group_by: [cache_class]              # break the summary (and every lane) down b
 stall_ms: 12                         # inter-token gap above this is a decode stall ("none" disables)
 dump_series: false                   # write every sample's raw per-token series into samples.jsonl
 
+# ---------- capability & void rules (optional; docs/capability-manifest.md) ----------
+capability:
+  url: http://localhost:8000/v1/models   # fetched before and after the run
+  headers: {Authorization: "Bearer ${API_KEY}"}
+  timeout_s: 10
+void_rules:
+  - {name: served-model, path: models.0, op: eq, value: qwen2.5-32b, at: both}
+  - {name: no-fallback, path: fallbacks, op: empty}
+model_revision: v1.2.3               # manifest: override the served-model revision
+record_env: [MY_SERVER_*]            # manifest: extra env globs to record
+
 # ---------- runner knobs (all optional) ----------
 connection_limit: 1000               # aiohttp TCPConnector limit
 timeout_s: 60                        # global default per-request timeout

@@ -20,6 +20,7 @@ import importlib
 from typing import Any, Callable, Optional
 
 from benchmaker.env import interpolate, load_dotenv
+from benchmaker.core.capability import parse_void_rules
 from benchmaker.core.load import parse_duration, parse_rate_spec
 from benchmaker.core.monitors import FunctionMonitor, Monitor, PrometheusMonitor
 from benchmaker.core.runner import BenchConfig, BenchLane
@@ -460,6 +461,10 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
         stall_ms=None if stall_ms in (None, "none", "off", False) else float(stall_ms),
         dump_series=bool(cfg.get("dump_series", False)),
         group_by=[str(k) for k in (cfg.get("group_by") or [])],
+        capability=cfg.get("capability") or None,
+        void_rules=parse_void_rules(cfg.get("void_rules")),
+        model_revision=(str(cfg["model_revision"]) if cfg.get("model_revision") else None),
+        record_env=[str(k) for k in (cfg.get("record_env") or [])],
     )
 
 def _build_lanes(spec: Any, *, duration_s: Optional[float],

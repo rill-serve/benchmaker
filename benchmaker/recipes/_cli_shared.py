@@ -58,3 +58,10 @@ def write_bundle_if_requested(runner, source_config: dict,
         notes=notes,
     )
     sys.stderr.write(f"[benchmaker] wrote bundle to {path}\n")
+    if runner.is_void():
+        for v in runner.metrics.summary().get("void", {}).get("violations", []):
+            sys.stderr.write(f"[benchmaker] VOID: rule {v['rule']!r} at {v['at']}: "
+                             f"{v['path']} {v['op']} {v['expected']!r} -> {v['actual']!r} ({v['reason']})\n")
+        sys.stderr.write("[benchmaker] run is VOID (a void rule was violated); "
+                         "bundle written, exiting 3\n")
+        sys.exit(3)

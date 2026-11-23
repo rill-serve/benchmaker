@@ -62,6 +62,8 @@ A benchmark in benchmaker is the composition of four things:
 17. [Decode stalls and cache classes](itl-cache-metrics.md) — token-level ITL
     percentiles pooled across requests, decode-stall accounting, and
     `group_by: [cache_class]` per-class summaries.
+18. [Capability, manifest, void runs](capability-manifest.md) — server
+    self-description before/after a run, `manifest.json`, and `void_rules`.
 
 ## Where things live
 

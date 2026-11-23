@@ -83,6 +83,11 @@ class SGLangGenerateWorkloadType(WorkloadType):
         hdrs.setdefault("Accept", "text/event-stream")
         self._headers = hdrs
 
+    @property
+    def model(self) -> None:
+        """``/generate`` has no model field; the served model is the server's."""
+        return None
+
     @classmethod
     def from_env(
         cls,
@@ -210,6 +215,9 @@ class SGLangGenerateWorkloadType(WorkloadType):
 
         if ttft is not None:
             sample.extra["ttft_s"] = ttft
+            sample.meta["ttft_token_kind"] = "content"
+            sample.meta["ttft_token_index"] = 0
+            sample.extra["ttft_token_index"] = 0.0
         if len(arrivals) >= 2:
             itl = [(arrivals[i] - arrivals[i - 1]) * 1000.0
                    for i in range(1, len(arrivals))]

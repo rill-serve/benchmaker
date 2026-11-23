@@ -15,7 +15,16 @@
   `cache_classifier:`), the new `group_by: [meta key, ...]` config key breaks
   the summary — and every lane/phase block — down by any `Sample.meta` key,
   down by any `Sample.meta` key.
-- Docs: `itl-cache-metrics.md`; `cli-and-yaml.md`, `metrics.md`, `workloads.md` updated.
+- **Capability, manifest, void runs (#4):** `capability: {url}` fetches the
+  server's self-description before and after the run
+  (`capability.start/end.json`); `void_rules:` assert on it (`eq/ne/lt/…/in/
+  contains` over dotted paths, at `start|end|both`) and mark the run void
+  (`summary.void`, `meta.void`, excluded from `collect`/`compare`,
+  `benchmaker run` exits 3). Every bundle now carries `manifest.json`
+  (config hash, prompt-set content hash, model id/revision, host + Slurm/
+  PBS/LSF/K8s job id, filtered env; `model_revision:` / `record_env:` keys).
+- Docs: `itl-cache-metrics.md`, `capability-manifest.md`; `cli-and-yaml.md`, `metrics.md`,
+  `workloads.md` updated.
 - Added the `agentx` recipe and workload (`benchmaker agentx`, YAML `type:
   agentx`): the SemiAnalysis AgentX v1.0 agentic-coding benchmark
   (https://inferencex.semianalysis.com/agentx). Replays the public WEKA-format

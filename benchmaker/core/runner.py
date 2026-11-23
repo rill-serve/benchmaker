@@ -13,6 +13,11 @@ import httpx2
 
 logger = logging.getLogger(__name__)
 
+from benchmaker.core.capability import (
+    VoidRule,
+    evaluate_void_rules,
+    fetch_json,
+)
 from benchmaker.core.load import LoadModel
 from benchmaker.core.metrics import DEFAULT_STALL_MS, ITL_SERIES, MetricsAggregator  # noqa: F401 (re-exported)
 from benchmaker.core.types import (
@@ -75,6 +80,17 @@ class BenchConfig:
     dump_series: bool = False
     # ``Sample.meta`` keys to break the summary down by (e.g. ``["cache_class"]``).
     group_by: list[str] = field(default_factory=list)
+    # --- issue #4: runtime capability capture and void rules -------------
+    # ``{"url": ..., "headers": {...}, "timeout_s": 10}``: fetched before and
+    # after the run; the snapshots are written to the bundle and feed void rules.
+    capability: Optional[dict[str, Any]] = None
+    void_rules: list[VoidRule] = field(default_factory=list)
+    # --- issue #4: manifest inputs -----------------------------------------
+    # ``model_revision`` overrides the served-model revision in the manifest
+    # (otherwise taken from the capability snapshot); ``record_env`` are env
+    # var globs recorded in the manifest in addition to the defaults.
+    model_revision: Optional[str] = None
+    record_env: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.lanes:
@@ -91,6 +107,8 @@ class BenchConfig:
 class BenchResult:
     samples: list[Sample]
     summary: dict
+    # Capability snapshots (``{"start": ..., "end": ...}``) when configured.
+    capability: Optional[dict[str, Any]] = None
 
 
 class BenchRunner:
@@ -101,6 +119,7 @@ class BenchRunner:
             group_by=list(config.group_by),
             dump_series=config.dump_series,
         )
+        self.capability: Optional[dict[str, Any]] = None
 
     async def run(self) -> BenchResult:
         # httpx2 has no per-connector force_close / ttl_dns_cache knobs; pooling
@@ -115,6 +134,8 @@ class BenchRunner:
         timeout = httpx2.Timeout(self.cfg.timeout_s)
         if self.cfg.recorder is not None:
             self.cfg.recorder.open(start_mono=self.metrics.start_time)
+        if self.cfg.capability:
+            await self._capture("start")
         async with httpx2.AsyncClient(limits=limits, timeout=timeout) as session:
             try:
                 await self._drive(session)
@@ -124,7 +145,37 @@ class BenchRunner:
                 if self.cfg.recorder is not None:
                     self.cfg.recorder.close()
         self.metrics.finalize()
-        return BenchResult(samples=self.metrics.samples, summary=self.metrics.summary())
+        if self.cfg.capability:
+            await self._capture("end")
+        return BenchResult(
+            samples=self.metrics.samples,
+            summary=self._summary(),
+            capability=self.capability,
+        )
+
+    def _summary(self) -> dict:
+        summary = self.metrics.summary()
+        if self.capability is not None:
+            summary["capability"] = self.capability
+            verdict = evaluate_void_rules(
+                self.cfg.void_rules, self.capability.get("start"), self.capability.get("end"))
+            summary["void"] = verdict.to_dict()
+        return summary
+
+    def is_void(self) -> bool:
+        """True when a [void rule](../core/capability.py) was violated (issue #4)."""
+        verdict = self._summary().get("void")
+        return bool(verdict and verdict.get("void"))
+
+    async def _capture(self, at: str) -> None:
+        cap = self.cfg.capability or {}
+        snapshot = await asyncio.to_thread(
+            fetch_json, cap.get("url", ""), float(cap.get("timeout_s", 10.0)), cap.get("headers"))
+        snapshot["at"] = at
+        snapshot["wall_time"] = time.time()
+        self.capability = {**(self.capability or {}), at: snapshot}
+        if not snapshot.get("ok"):
+            logger.warning("capability snapshot (%s) failed: %s", at, snapshot.get("error"))
 
     async def _drive(self, session: httpx2.AsyncClient) -> None:
         sem = asyncio.Semaphore(self.cfg.max_in_flight)
@@ -369,17 +420,53 @@ class BenchRunner:
         except asyncio.CancelledError:
             return
 
-    def write_bundle(self, out_dir: str, **kwargs) -> str:
-        """Write a per-run directory bundle. See `benchmaker.io.bundle.write_bundle`."""
+    def write_bundle(self, out_dir: str, *, manifest: Optional[dict] = None,
+                     source_config: Optional[dict] = None, labels: Optional[dict] = None,
+                     model_revision: Optional[str] = None,
+                     env_overrides: Optional[dict[str, str]] = None,
+                     record_env: Optional[list[str]] = None, **kwargs) -> str:
+        """Write a per-run directory bundle. See `benchmaker.io.bundle.write_bundle`.
+
+        Builds the :mod:`benchmaker.io.manifest` unless one is passed in.
+        ``model_revision`` / ``record_env`` default to the config's
+        ``model_revision`` / ``record_env`` keys.
+        """
+        from benchmaker import __version__ as bm_version
         from benchmaker.io.bundle import write_bundle
+        from benchmaker.io.manifest import build_manifest
+
+        model_revision = model_revision if model_revision is not None else self.cfg.model_revision
+        record_env = record_env if record_env is not None else (list(self.cfg.record_env) or None)
+
+        workload_name = (
+            "mix:" + ",".join(lane.name for lane in self.cfg.lanes)
+            if self.cfg.lanes else self.cfg.workload.name
+        )
+        if manifest is None:
+            manifest = build_manifest(
+                source_config=source_config or {},
+                run_id=str(kwargs.get("run_id") or ""),
+                workload_type=self.cfg.workload_type,
+                workload=self.cfg.workload,
+                workload_name=workload_name,
+                labels=labels,
+                started_at=self.metrics.start_wall,
+                model_revision=model_revision,
+                capability=self.capability,
+                env=env_overrides,
+                record_env=record_env,
+                benchmaker_version=bm_version,
+            )
         return write_bundle(
             out_dir,
             self.metrics,
             workload_type_name=self.cfg.workload_type.name,
-            workload_name=(
-                "mix:" + ",".join(lane.name for lane in self.cfg.lanes)
-                if self.cfg.lanes else self.cfg.workload.name
-            ),
+            workload_name=workload_name,
+            capability=self.capability,
+            manifest=manifest,
+            summary=self._summary(),
+            source_config=source_config,
+            labels=labels,
             **kwargs,
         )
 

@@ -163,6 +163,8 @@ Full docs live in [`docs/`](docs/):
 - [Agentic](docs/agentic.md) — multi-turn prefix-cache parity replay
 - [Decode stalls and cache classes](docs/itl-cache-metrics.md) — pooled ITL
   percentiles, stall accounting and per-cache-class summaries
+- [Capability, manifest, void runs](docs/capability-manifest.md) — server
+  self-description snapshots, `manifest.json`, `void_rules`
 
 ## Deterministic replay (`swebench-replay`)
 

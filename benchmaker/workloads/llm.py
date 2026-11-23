@@ -25,6 +25,11 @@ classification / provenance kept in `Sample.meta` (not aggregated):
     cache_class         "device_hit" | "restore" | "partial" | "miss", from
                         usage + cache-source hints (see `classify_cache`)
     cache_hint          raw cache-source hint the server gave (if any)
+    ttft_token_kind     "content" or "reasoning": which kind of token the
+                        headline `ttft_s` was stamped on
+    ttft_token_index    index of that token in the stream (0 = first token),
+                        so a TTFT drop caused by an earlier first *reasoning*
+                        token is detectable (issue #4)
 
 Raw per-token inter-token gaps (ms) are kept on every sample as
 ``sample.series["itl_ms"]`` and pooled across requests by the summary
@@ -155,6 +160,11 @@ class OpenAIChatWorkloadType(WorkloadType):
         if api_key:
             hdrs.setdefault("Authorization", f"Bearer {api_key}")
         self._headers = hdrs
+
+    @property
+    def model(self) -> Optional[str]:
+        """Model id placed in the request body (used by the run manifest, #4)."""
+        return self._model
 
     @classmethod
     def from_env(
@@ -298,6 +308,7 @@ class OpenAIChatWorkloadType(WorkloadType):
         # inter-token latency reflects true decode cadence across the whole
         # generation instead of conflating the reasoning phase.
         token_arrival_times: list[float] = []
+        token_kinds: list[str] = []
         usage_completion_tokens: Optional[int] = None
         reasoning_tokens: Optional[int] = None
         prompt_tokens: Optional[int] = None
@@ -371,10 +382,12 @@ class OpenAIChatWorkloadType(WorkloadType):
                     if first_content_token is None:
                         first_content_token = t
                     token_arrival_times.append(t)
+                    token_kinds.append("content")
                 if reasoning_piece:
                     if first_token is None:
                         first_token = t
                     token_arrival_times.append(t)
+                    token_kinds.append("reasoning")
                 if ch.get("finish_reason"):
                     finish_reason = ch["finish_reason"]
 
@@ -400,6 +413,16 @@ class OpenAIChatWorkloadType(WorkloadType):
         ttft = first_content_token if self._ttft_token == "content" else first_token
         if ttft is not None:
             sample.extra["ttft_s"] = ttft
+            # Provenance of the headline TTFT: which token it was stamped on
+            # and where in the stream. A TTFT that dropped because a reasoning
+            # token now arrives first is not a prefill win (issue #4).
+            idx = _first_index(token_arrival_times, ttft)
+            kind = token_kinds[idx] if idx is not None else None
+            if kind is not None:
+                sample.meta["ttft_token_kind"] = kind
+            if idx is not None:
+                sample.meta["ttft_token_index"] = idx
+                sample.extra["ttft_token_index"] = float(idx)
         if first_content_token is not None and first_content_token != ttft:
             sample.extra["content_ttft_s"] = first_content_token
 
@@ -559,6 +582,13 @@ def _hint_is_restore(hint: str) -> bool:
     if any(w in h for w in _DEVICE_WORDS):
         return False
     return any(w in h for w in _RESTORE_WORDS)
+
+
+def _first_index(times: list[float], t: float) -> Optional[int]:
+    for i, v in enumerate(times):
+        if v == t:
+            return i
+    return None
 
 
 def _warn_missing_usage_once(request: Request) -> None:

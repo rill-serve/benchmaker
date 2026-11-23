@@ -118,6 +118,7 @@ StaticWorkload(items=[
 - `content_tokens`   — `completion_tokens - reasoning_tokens` when both known
 - `prompt_tokens` — when present in `usage`
 - `cached_tokens`, `cached_ratio` — prefix-cache hits from `usage` (`cached_ratio = cached / prompt`)
+- `ttft_token_index` — chunk index the first token arrived at (TTFT parity check)
 
 `ttft_token` (`"any"` | `"content"`, default `"any"`) selects which token the
 headline `ttft_s` is measured to: the first token of any kind (reasoning *or*
@@ -143,7 +144,7 @@ response headers. Pass `cache_classifier: 'module:fn'` to override it for
 your server (the function receives a `CacheClassInfo` and returns a class
 name or `None`). With `group_by: [cache_class]` the summary is then broken
 down per class; see
-[Decode stalls and cache classes](itl-cache-metrics.md).
+[Decode stalls, cache classes, TTFT parity](itl-cache-metrics.md).
 
 ### `DeepRAGWorkload`
 

@@ -1,11 +1,14 @@
-# Decode stalls and cache classes
+# Decode stalls, cache classes, and TTFT parity
 
-Issues #1 and #2: a mean ITL hides the stalls that make decode *feel*
-slow, and an aggregate TTFT hides which cache class paid for it. This page
-covers the two mechanisms benchmaker adds for that:
+Issues #1, #2 and #4: a mean ITL hides the stalls that make decode
+*feel* slow, an aggregate TTFT hides which cache class paid for it, and a
+TTFT compared across servers is meaningless if the two servers stamp "first
+token" on different events. This page covers the three mechanisms benchmaker
+adds for that:
 
 1. **Pooled ITL and stall accounting** (`itl_ms_pooled`, `stalls`) — issue #1.
 2. **Cache classes and `group_by`** — per-class TTFT — issue #2.
+3. **TTFT parity** — what each server's TTFT was measured on — issue #4.
 
 All of it is derived from the same `samples.jsonl` and `summary.json` that
 every run bundle already writes; nothing here needs a special server.
@@ -135,3 +138,45 @@ adds, to the top level **and** to every lane block of `summary.json`:
 `group_by` accepts any `Sample.meta` key (`lane`, a dataset column, any tag a
 workload puts on its items, …).
 
+## 3. TTFT parity (#4)
+
+TTFT is stamped on the arrival of the first streamed token *of the kind the
+workload is configured to look for* (`ttft_token: any | content`, see
+[Workloads](workloads.md#openaichatworkloadtype)). Two servers can therefore
+report TTFTs that are not comparable:
+
+- one arm has a reasoning parser and emits `reasoning_content` deltas; with
+  `ttft_token: content` its TTFT skips the whole reasoning phase while the
+  other arm's does not;
+- the first token the server emits may be at a different chunk *index* (an
+  empty role delta, a leading newline, a parsed `<think>` marker…).
+
+Every sample therefore records the chunk index its TTFT was stamped on
+(`extra.ttft_token_index`; summarized as
+`workload_metrics.ttft_token_index`), and the bundle keeps the `ttft_token`
+setting in `meta.source_config`. `benchmaker arms` / `benchmaker compare`
+collect these per arm (`ttft_parity` in `comparison.json`) and **warn** (not
+fail — it is for you to judge) when:
+
+- `kind` differs between arms ("arms stamp TTFT on different token kinds"), or
+- the median first-token index differs by ≥ 1 ("arms' first-token index
+  differs").
+
+The raw data is on every sample (`extra.ttft_token_index`,
+`extra.content_ttft_s`), so a run with `ttft_token: any` still lets you
+recompute a content-only TTFT offline.
+
+## Reading order within a comparison
+
+For a multi-arm comparison, the recommended order is:
+
+1. Fix TTFT parity first (same `ttft_token`, same parser situation) —
+   otherwise every TTFT number below is off by a reasoning phase.
+2. Look at `groups.cache_class` shares: are the arms even seeing the same
+   hit mix? If not, the decomposition tells you how much of Δ is mix.
+3. Compare `itl_ms_pooled.p99.5` and `stalls.excess_ms` rather than
+   `itl_ms_mean`.
+4. Only then read the headline `ttft_p50/p99` and `throughput_rps`.
+
+See [Multi-arm comparisons](arms.md) for the commands that put all of this
+in one table.

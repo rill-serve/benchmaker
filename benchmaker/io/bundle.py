@@ -3,10 +3,14 @@
 Each benchmark run writes a directory:
 
     <out_dir>/<run_id>/
-        meta.json       # run identifiers, timestamps, resolved config
-        summary.json    # aggregated metrics
-        samples.jsonl   # one record per request
-        monitors.jsonl  # one record per monitor tick
+        meta.json              # run identifiers, timestamps, resolved config
+        manifest.json          # what was benchmarked: config/prompt-set hashes,
+                               # model+revision, host/job identity, env (#4)
+        summary.json           # aggregated metrics
+        samples.jsonl          # one record per request
+        monitors.jsonl         # one record per monitor tick
+        capability.start.json  # server self-description before the run (#4, optional)
+        capability.end.json    # ... and after it (optional)
 
 The bundle is the unit of result interchange. `benchmaker collect` walks
 one or more such directories and pivots the summaries into a table.
@@ -26,11 +30,14 @@ from typing import Any, Optional
 from benchmaker.core.metrics import MetricsAggregator, _safe_meta
 
 
-BUNDLE_VERSION = 1
+BUNDLE_VERSION = 2
 META_FILENAME = "meta.json"
+MANIFEST_FILENAME = "manifest.json"
 SUMMARY_FILENAME = "summary.json"
 SAMPLES_FILENAME = "samples.jsonl"
 MONITORS_FILENAME = "monitors.jsonl"
+CAPABILITY_START_FILENAME = "capability.start.json"
+CAPABILITY_END_FILENAME = "capability.end.json"
 
 
 def default_run_id(prefix: Optional[str] = None) -> str:
@@ -56,6 +63,9 @@ class RunMeta:
     source_config: dict = field(default_factory=dict)
     labels: dict = field(default_factory=dict)
     notes: str = ""
+    # Void verdict (issue #4): None when no void rules were configured.
+    void: Optional[bool] = None
+    void_violations: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -71,6 +81,8 @@ class RunMeta:
             "workload": self.workload,
             "labels": self.labels,
             "notes": self.notes,
+            "void": self.void,
+            "void_violations": self.void_violations,
             "source_config": _safe_meta(self.source_config),
         }
 
@@ -87,12 +99,23 @@ def write_bundle(
     notes: str = "",
     started_wall: Optional[float] = None,
     ended_wall: Optional[float] = None,
+    manifest: Optional[dict] = None,
+    capability: Optional[dict[str, Any]] = None,
+    summary: Optional[dict] = None,
 ) -> str:
     """Write the bundle for a finished run. Returns the absolute run directory path.
+
+    ``summary`` overrides ``metrics.summary()`` — the runner passes the
+    summary it already enriched (capability, void verdict, phase windows).
 
     `out_dir` is treated as the parent: the actual run lives in `<out_dir>/<run_id>/`.
     If `out_dir` itself already looks like a run dir (already has `<run_id>` baked in),
     pass `run_id=""` to skip the extra nesting.
+
+    ``manifest`` (see :mod:`benchmaker.io.manifest`) and ``capability``
+    (``{"start": ..., "end": ...}`` snapshots) are written as separate files
+    when given (#4). The void verdict, if any, is copied into ``meta.json`` so
+    `collect` can flag void runs without opening summary.json.
     """
     from benchmaker import __version__ as bm_version
 
@@ -107,6 +130,9 @@ def write_bundle(
     end_wall = ended_wall if ended_wall is not None else (metrics.end_wall or time.time())
     start_wall = started_wall if started_wall is not None else (metrics.start_wall or (end_wall - duration))
 
+    summary = summary if summary is not None else metrics.summary()
+    void = summary.get("void")
+
     meta = RunMeta(
         run_id=run_id or os.path.basename(os.path.abspath(target)),
         started_at=_iso(start_wall),
@@ -118,13 +144,29 @@ def write_bundle(
         source_config=source_config or {},
         labels=labels or {},
         notes=notes,
+        void=bool(void["void"]) if void else None,
+        void_violations=list(void.get("violations", [])) if void else [],
     )
 
     with open(os.path.join(target, META_FILENAME), "w") as f:
         json.dump(meta.to_dict(), f, indent=2, default=_json_default)
 
+    if manifest is not None:
+        if not manifest.get("run_id"):
+            manifest["run_id"] = meta.run_id
+        if not manifest.get("started_at"):
+            manifest["started_at"] = meta.started_at
+        with open(os.path.join(target, MANIFEST_FILENAME), "w") as f:
+            json.dump(manifest, f, indent=2, default=_json_default)
+
     with open(os.path.join(target, SUMMARY_FILENAME), "w") as f:
-        json.dump(metrics.summary(), f, indent=2, default=_json_default)
+        json.dump(summary, f, indent=2, default=_json_default)
+
+    for at, name in (("start", CAPABILITY_START_FILENAME), ("end", CAPABILITY_END_FILENAME)):
+        snap = (capability or {}).get(at)
+        if snap is not None:
+            with open(os.path.join(target, name), "w") as f:
+                json.dump(snap, f, indent=2, default=_json_default)
 
     metrics.dump_samples_jsonl(os.path.join(target, SAMPLES_FILENAME))
     if metrics.monitor_samples:
@@ -134,10 +176,12 @@ def write_bundle(
 
 
 def read_bundle(run_dir: str) -> dict:
-    """Read a run directory and return `{meta, summary, samples_path, monitors_path}`.
+    """Read a run directory and return
+    ``{meta, summary, manifest, capability, samples_path, monitors_path, dir}``.
 
     Samples and monitor ticks are returned as file paths rather than loaded, so
     a `collect` over many runs stays cheap. Use `iter_jsonl` to stream rows.
+    ``manifest`` and ``capability`` are ``None`` for bundles written before #4.
     """
     meta_path = os.path.join(run_dir, META_FILENAME)
     summary_path = os.path.join(run_dir, SUMMARY_FILENAME)
@@ -154,6 +198,11 @@ def read_bundle(run_dir: str) -> dict:
     return {
         "meta": meta,
         "summary": summary,
+        "manifest": _read_json_if_exists(os.path.join(run_dir, MANIFEST_FILENAME)),
+        "capability": {
+            at: _read_json_if_exists(os.path.join(run_dir, name))
+            for at, name in (("start", CAPABILITY_START_FILENAME), ("end", CAPABILITY_END_FILENAME))
+        },
         "samples_path": samples if os.path.isfile(samples) else None,
         "monitors_path": monitors if os.path.isfile(monitors) else None,
         "dir": os.path.abspath(run_dir),
@@ -176,6 +225,13 @@ def iter_jsonl(path: str):
             if not line:
                 continue
             yield json.loads(line)
+
+
+def _read_json_if_exists(path: str) -> Optional[Any]:
+    if not os.path.isfile(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
 
 
 def _iso(wall_seconds: float) -> str:
