@@ -540,6 +540,10 @@ progress_every_s: 1.0                # 0 disables progress output
 - `capacity` (or `capacity-revisit`) — `CapacityRevisitWorkload(...)`: warm
   pass over N long documents then revisit passes, tagged per visit. See
   [Phases & capacity](phases-capacity.md).
+- `mooncake-trace` / `azure-trace` / `trace-replay` (auto-detect) —
+  published serving traces with real arrival times and (Mooncake) block-hash
+  prefix structure. Pair with `load: {type: trace}`. See
+  [Replaying published traces](trace-replay.md).
 - `factory: 'module:fn'` — call `fn(**kwargs)`; must return a `Workload`.
 
 You can also write a workload as bare YAML for two shortcuts:
@@ -562,6 +566,7 @@ load: closed:32
 load: ramp:10..500:30s
 load: ramp-poisson:10..500:30s
 load: sweep:10,50,100,500@30s
+load: {type: trace, speed: 1.0}     # trace replay: each item at its own arrival time
 ```
 
 Equivalent dict form, when you want more knobs:

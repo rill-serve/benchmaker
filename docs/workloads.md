@@ -151,11 +151,12 @@ down per class; see
 **Item `meta`.** A dict item may carry a `meta` mapping alongside the request
 fields. It is **not** sent to the server: it is merged into `Request.meta`
 and from there into `Sample.meta`, so dataset tags (`visit`, `doc_id`,
-`phase`, …) reach `samples.jsonl` and `group_by`. Numeric
-`prompt_tokens_hint` / `prefix_tokens_hint` / `rag_depth` in it are promoted
-to `Sample.extra` and summarized. The
-[capacity](phases-capacity.md) workload uses this; with
-`passthrough_meta: true` the same happens for any JSONL column.
+`phase`, trace fields, …) reach `samples.jsonl` and `group_by`. Numeric
+`prompt_tokens_hint` / `prefix_tokens_hint` / `rag_depth` and any numeric
+`trace_*` key in it are promoted to `Sample.extra` and summarized. The
+[capacity](phases-capacity.md) and [trace-replay](trace-replay.md) workloads
+use this; with `passthrough_meta: true` the same happens for any JSONL
+column.
 
 ### `DeepRAGWorkload`
 

@@ -156,9 +156,10 @@ One JSON object per line:
 
 `meta.lane` / `meta.phase` come from `mix` / `phases`, `meta.cache_class`
 from the OpenAI workload-type's classifier, `meta.warmup: true` marks
-warm-up samples (absent otherwise), and any workload item's own `meta` dict
-(capacity tags, dataset columns) is merged in; numeric workload metrics in it
-are promoted to `extra`. `series` is only written with `dump_series: true`.
+warm-up samples (absent otherwise), and any workload item's own `meta` dict (capacity tags, trace
+fields, dataset columns) is merged in. Numeric workload metrics and the
+`trace_*` fields are promoted to `extra`. `series` is only written with
+`dump_series: true`.
 
 ### `monitors.jsonl`
 

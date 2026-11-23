@@ -171,6 +171,8 @@ Full docs live in [`docs/`](docs/):
   workload
 - [Multi-arm comparisons](docs/arms.md) — `benchmaker arms` / `compare`:
   interleaved reps, per-rep bundles, same-job enforcement, comparison table
+- [Replaying published traces](docs/trace-replay.md) — Mooncake (block-hash
+  prefix structure) and Azure LLM inference traces with real arrival times
 
 ## Deterministic replay (`swebench-replay`)
 

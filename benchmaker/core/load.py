@@ -14,7 +14,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import AsyncIterator, Optional, Union
+from typing import AsyncIterator, Optional, Sequence, Union
 
 
 class LoadModel(ABC):
@@ -221,6 +221,38 @@ class Ramp(LoadModel):
 # -------- User-friendly spec parser --------
 
 _DURATION_RE = re.compile(r"^([0-9]*\.?[0-9]+)(ms|s|m|h)?$")
+
+
+class TraceArrivalsLoad(LoadModel):
+    """Fire ticket ``i`` at ``times[i] / speed`` seconds after start, **in order**.
+
+    Unlike :class:`TracePacedLoad` the times are not re-sorted: ticket ``i``
+    belongs to workload item ``i``, so a trace replay keeps every request's
+    own arrival time and prompt (issue #6). Tickets whose time has already
+    passed fire immediately (open-loop catch-up). ``max_requests`` caps the
+    count; ``speed`` ``2.0`` halves every inter-arrival gap.
+    """
+
+    def __init__(self, times: Sequence[float], speed: float = 1.0,
+                 max_requests: Optional[int] = None):
+        if speed <= 0:
+            raise ValueError("speed must be > 0")
+        self._times = [float(t) for t in times]
+        self._speed = float(speed)
+        self._max = max_requests
+
+    async def tickets(self):
+        start = time.monotonic()
+        n = 0
+        for t_rel in self._times:
+            if self._max is not None and n >= self._max:
+                return
+            target = start + max(t_rel, 0.0) / self._speed
+            now = time.monotonic()
+            if target > now:
+                await asyncio.sleep(target - now)
+            yield None
+            n += 1
 
 
 def parse_duration(s: Union[str, int, float]) -> float:

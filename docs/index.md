@@ -69,6 +69,8 @@ A benchmark in benchmaker is the composition of four things:
     for measuring a working set larger than the device cache.
 20. [Multi-arm comparisons](arms.md) — `benchmaker arms` / `compare`: ABBA
     interleaving, per-rep bundles, same-job enforcement, the comparison table.
+21. [Replaying published traces](trace-replay.md) — Mooncake (block-hash
+    prefix structure) and Azure LLM inference traces with real arrival times.
 
 ## Where things live
 

@@ -485,6 +485,12 @@ class OpenAIChatWorkloadType(WorkloadType):
             value = request.meta.get(metric)
             if isinstance(value, (int, float)):
                 sample.extra[metric] = float(value)
+        # Numeric trace fields (trace_input_tokens, trace_output_tokens,
+        # trace_blocks, ...) become metrics too, so a replayed run reports the
+        # trace's token distribution next to what the server measured (#6).
+        for key, value in request.meta.items():
+            if key.startswith("trace_") and isinstance(value, (int, float)) and not isinstance(value, bool):
+                sample.extra[key] = float(value)
 
         if completion_tokens > 0 and ttft is not None and response.elapsed_s > ttft:
             sample.extra["tokens_per_s"] = completion_tokens / (response.elapsed_s - ttft)

@@ -60,6 +60,16 @@
   recorded decode lengths (`ignore_eos`), and a default one-hour profiling
   window. Includes `tools/agentx/prepare.py` for corpus download/subsetting
   and `docs/agentx.md`.
+- **Serving-trace replay (#6):** `mooncake-trace` / `azure-trace` /
+  `trace-replay` workloads (JSONL/JSONL.gz/parquet, CSV/CSV.gz/.zip;
+  `max_records`, `max_duration_s`, `max_input/output_tokens`) keep every
+  request's arrival time — via `load: {type: trace, speed}`
+  (`TraceArrivalsLoad`, not re-sorted) — and Mooncake's `hash_ids` prefix
+  structure (every block id rendered deterministically, so the served prefix
+  cache sees the trace's sharing graph). Trace fields ride on `sample.meta`
+  and numeric ones on `sample.extra` (`trace_input_tokens`, …). Workload
+  item `meta` dicts are now carried onto `Request.meta` instead of being sent
+  in the body.
 - **Breaking:** renamed the `trajectory-replay` workload to `agentic`, since it
   represents multi-turn *agentic* workloads. The CLI recipe is now
   `benchmaker agentic` (was `trajectory-replay`); the YAML workload `type:
