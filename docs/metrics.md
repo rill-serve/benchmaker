@@ -37,6 +37,10 @@ runs/<run_id>/
     capability.end.json    # ... and after it
 ```
 
+Multi-arm runs nest bundles under `runs/<run_id>/arms/<arm>/rep-<k>/` and add
+`plan.json`, `arms.log`, `comparison.json` and `comparison.md` at the root
+(see [Multi-arm comparisons](arms.md)).
+
 `run_id` defaults to a UTC timestamp like `20260526T142233Z`. Pass `--run-id`
 to set it explicitly. The directory is the unit of result interchange — copy
 it, tar it, share it.

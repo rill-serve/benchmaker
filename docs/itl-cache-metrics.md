@@ -1,13 +1,14 @@
 # Decode stalls, cache classes, and TTFT parity
 
-Issues #1, #2 and #4: a mean ITL hides the stalls that make decode
-*feel* slow, an aggregate TTFT hides which cache class paid for it, and a
-TTFT compared across servers is meaningless if the two servers stamp "first
-token" on different events. This page covers the three mechanisms benchmaker
-adds for that:
+Issues #1 and #2: a mean ITL hides the stalls that make decode *feel* slow,
+an aggregate TTFT hides which cache class paid for it, and a TTFT compared
+across servers is meaningless if the two servers stamp "first token" on
+different events. This page covers the three mechanisms benchmaker adds for
+that:
 
 1. **Pooled ITL and stall accounting** (`itl_ms_pooled`, `stalls`) — issue #1.
-2. **Cache classes and `group_by`** — per-class TTFT — issue #2.
+2. **Cache classes and `group_by`** — per-class TTFT and the mix/latency
+   decomposition of a TTFT difference — issue #2.
 3. **TTFT parity** — what each server's TTFT was measured on — issue #4.
 
 All of it is derived from the same `samples.jsonl` and `summary.json` that
@@ -82,6 +83,10 @@ With `dump_series: true` each `samples.jsonl` record carries
 `"series": {"itl_ms": [...], "ttft_ms": [...]}`, which is what you want when
 plotting a timeline or recomputing stalls offline at a different threshold.
 
+`stalls_per_req`, `stall_excess_ms`, `itl_p99.5` and `itl_p99.9` are metric
+aliases understood by `benchmaker collect`, `benchmaker arms` and
+`benchmaker compare` (see [Multi-arm comparisons](arms.md)).
+
 ## 2. Cache classes and `group_by` (#2)
 
 ### The problem
@@ -122,7 +127,8 @@ A classifier returning `None` leaves the sample untagged.
 group_by: [cache_class]
 ```
 
-adds, to the top level **and** to every lane block of `summary.json`:
+adds, to the top level **and** to every phase and lane block of
+`summary.json`:
 
 ```python
 "groups": {
@@ -135,8 +141,46 @@ adds, to the top level **and** to every lane block of `summary.json`:
 }
 ```
 
-`group_by` accepts any `Sample.meta` key (`lane`, a dataset column, any tag a
-workload puts on its items, …).
+`group_by` accepts any `Sample.meta` key (`visit`, `phase`, `lane`, `doc_id`,
+trace fields, …), so the same mechanism serves the capacity-revisit and trace
+replay workloads.
+
+### Mix vs latency decomposition
+
+Given two summaries with the same `group_by` key, benchmaker splits the
+difference in mean TTFT exactly into a *mix* term (the hit distribution
+changed) and a *latency* term (each class is served faster or slower), using
+the symmetric Shapley/midpoint decomposition:
+
+```
+Δ = Σ_c (s_b − s_a)·(μ_a + μ_b)/2   +   Σ_c (s_a + s_b)/2·(μ_b − μ_a)
+    |------- mix: hit-rate change --|   |------ latency: per-class -----|
+```
+
+It is order-independent (swapping A and B only flips signs) and the two terms
+sum to the raw difference. `benchmaker arms` and `benchmaker compare` print it
+for every non-reference arm:
+
+```
+TTFT decomposition (ref = vllm) — rill
+  class       share vllm→rill   mean TTFT vllm→rill (ms)   mix (ms)   latency (ms)
+  device_hit      0.42 → 0.71          38 → 36           −10.9        −0.6
+  restore         0.20 → 0.18         210 → 140            +0.5        −1.4
+  miss            0.38 → 0.11         150 → 152            +8.8        −0.0
+  total                              104 →  84            −1.6       −2.0
+```
+
+Interpretation: of the 20 ms improvement, 1.6 ms is a better hit *mix* and
+2.0 ms is genuinely faster *per class*; the rest of the difference is
+interaction captured inside the two terms (the decomposition is exact, so
+`mix + latency == Δ`).
+
+From Python:
+
+```python
+from benchmaker.core.compare import decompose_ttft
+dec = decompose_ttft(summary_a, summary_b, key="cache_class")
+```
 
 ## 3. TTFT parity (#4)
 

@@ -8,7 +8,9 @@ into two groups:
   chat), `sandbox` (Flash Sandbox), `swebench` (SWE-bench Verified eval),
   `sglang` (SGLang native `/generate`), `agentic` (prefix-cache
   parity), and `swebench-replay` (deterministic SWE-bench re-evaluation).
-- **Infra commands** — `run` (drive any benchmark from a YAML config file) and `collect` (pivot many run-dirs into a table).
+- **Infra commands** — `run` (drive any benchmark from a YAML config file),
+  `arms` / `compare` (multi-arm A/B with interleaved reps and a comparison
+  table), and `collect` (pivot many run-dirs into a table).
 
 > `quick` is a deprecated alias for `http`; it still works but prints a warning.
 
@@ -327,6 +329,48 @@ Options:
 | `--replay PATH`                               | Replay a previously recorded trace at the same relative timings. Overrides `workload_type` / `workload` / `load` (and any `replay:` in YAML). |
 | `--replay-speed FLOAT`                        | Speed multiplier for `--replay` (default `1.0`; `2.0` = double speed). |
 | `--quiet`                                     | Suppress progress output                         |
+
+## `benchmaker arms`
+
+Run one YAML config against several servers ("arms"), several reps each,
+interleaved (ABBA / rep-major / random), writing one bundle per (arm, rep)
+and a comparison table. See [Multi-arm comparisons](arms.md) for the YAML
+`arms:` block and how to read the table.
+
+```bash
+benchmaker arms arms.yaml --out-dir ./runs --label gpus=8xh100
+benchmaker arms arms.yaml --out-dir ./runs --dry-run          # print the plan only
+benchmaker arms arms.yaml --out-dir ./runs --reps 2 --allow-mixed-jobs
+```
+
+| Flag                    | Meaning                                                        |
+| ----------------------- | -------------------------------------------------------------- |
+| `--out-dir DIR`         | Parent of `<run-id>/arms/<arm>/rep-<k>/` bundles (required)     |
+| `--run-id`, `--label`, `--notes`, `--dotenv`, `--quiet` | as for `run`                                    |
+| `--reps N`              | Override `arms.reps`                                           |
+| `--allow-mixed-jobs`    | Do not exit 2 when reps came from different jobs/hosts          |
+| `--dry-run`             | Print the `(arm, rep)` execution order and exit                 |
+
+Exit codes: `0` done; `2` same-job check violated and `--allow-mixed-jobs`
+not given (bundles and `comparison.*` are still written).
+
+## `benchmaker compare`
+
+Rebuild the comparison from finished arms bundles without any requests:
+
+```bash
+benchmaker compare ./runs/20260701T120000Z
+benchmaker compare ./runs --reference vllm --metric ttft_p99 --format json
+```
+
+| Flag                    | Meaning                                                        |
+| ----------------------- | -------------------------------------------------------------- |
+| `PATH...`               | Arms run roots (`<root>/arms/<arm>/rep-<k>/`) or dirs of them   |
+| `--reference ARM`       | Ratio baseline (default: the first arm in the plan)             |
+| `--metric ALIAS`        | Metric alias or dotted `summary.json` path; repeatable          |
+| `--warmup-reps N`       | Override the number of excluded reps (default: from `plan.json`) |
+| `--allow-mixed-jobs`    | Do not exit 2 on a same-job violation                           |
+| `--format md\|json`    | Table for humans / `comparison.json` on stdout                  |
 
 ## `benchmaker collect`
 

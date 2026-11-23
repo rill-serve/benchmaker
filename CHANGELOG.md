@@ -14,7 +14,10 @@
   `partial` / `miss`, from `usage` + headers; override with
   `cache_classifier:`), the new `group_by: [meta key, ...]` config key breaks
   the summary — and every lane/phase block — down by any `Sample.meta` key,
-  down by any `Sample.meta` key.
+  and `benchmaker.core.compare.decompose_ttft` splits a TTFT difference
+  between two runs into an exact mix (hit-rate) and latency (per-class) term.
+  TTFT parity: `extra.ttft_token_index` and the `ttft_token` setting are
+  compared across arms and warned about when they differ.
 - **Capability, manifest, void runs (#4):** `capability: {url}` fetches the
   server's self-description before and after the run
   (`capability.start/end.json`); `void_rules:` assert on it (`eq/ne/lt/…/in/
@@ -33,8 +36,18 @@
   synthesized, token-exact with `tokenizer:`) then K revisit passes (sequential
   or seeded random), each visit tagged `visit`/`pass_index`/`doc_id`, with
   `stage: warm|revisit` views for phased recipes.
-- Docs: `itl-cache-metrics.md`, `capability-manifest.md`, `phases-capacity.md`;
-  `cli-and-yaml.md`, `metrics.md`, `workloads.md` updated.
+- **Multi-arm comparisons (#3):** new `benchmaker arms` command (YAML
+  `arms:` block; `reps`, `order: abba|rep-major|random`, `warmup_reps`,
+  `reference`, per-arm `config` deep-merge / `env` / `launch` hook /
+  `relaunch`, `metrics`) runs one bundle per (arm, rep) and writes
+  `comparison.md/.json`; `benchmaker compare` rebuilds the table from
+  finished bundles. Per-rep medians with min–max, ratios vs the reference,
+  same-job/same-host enforcement (exit 2 unless `--allow-mixed-jobs`), void
+  exclusion, TTFT parity warnings and the TTFT decomposition. Library:
+  `benchmaker.core.arms`, `benchmaker.core.compare`.
+- Docs: `itl-cache-metrics.md`, `arms.md`, `capability-manifest.md`,
+  `phases-capacity.md`, `trace-replay.md`; `cli-and-yaml.md`, `load-models.md`,
+  `metrics.md`, `workloads.md` updated.
 - Added the `agentx` recipe and workload (`benchmaker agentx`, YAML `type:
   agentx`): the SemiAnalysis AgentX v1.0 agentic-coding benchmark
   (https://inferencex.semianalysis.com/agentx). Replays the public WEKA-format
