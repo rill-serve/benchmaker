@@ -68,7 +68,11 @@ capability.<model>.end.json      # model name with / : . @ replaced by _
 stay for single-endpoint runs), `void_rules` are evaluated against every
 endpoint's snapshots (a violation names the endpoint in its `path`:
 `endpoints.<model>.models.0`), and `manifest.endpoints.<model>` records that
-server's URL and the model id / revision it reported.
+server's URL and the model id / revision it reported. An endpoint without
+its own `capability:` URL gets the shared one with scheme/host swapped, else
+the `/v1/models` listing next to its request URL (`url_source: default` in
+the snapshot; a failed default capture is logged at info level, a failed
+URL you typed at warning level).
 
 ## Void rules
 
@@ -80,6 +84,7 @@ void_rules:
     value: qwen2.5-32b
     at: both                     # start | end | both (default end)
     ignore_missing: false        # a missing path is not a violation
+    endpoint: qwen2.5-7b         # only check this rule against that endpoint of an `endpoints:` map (#15)
   - name: no-fallback
     path: attention_backend
     op: eq
@@ -124,6 +129,13 @@ Notes:
   `_**arm VOID**: rule …_`. The bundle itself is untouched.
 - `benchmaker run` exits with code 3 when the run is void (the bundle is
   still written), so a CI script can refuse to publish it.
+
+With `endpoints:`, an unscoped rule is checked against **every** endpoint's
+snapshot and a scoped one (`endpoint:` — or a path written
+`endpoints.<model>.<rest>`) only against its own, so a rule about the small
+model's fallbacks does not void the big model's reps (issue #15). A scoped
+rule naming no configured endpoint, or naming the endpoint but no field of
+its snapshot, is a config error (`validate_rule_scopes`).
 
 From Python: `benchmaker.core.capability.parse_void_rules`,
 `check_rule`, `evaluate_void_rules`.

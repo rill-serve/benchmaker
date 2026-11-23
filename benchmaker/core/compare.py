@@ -333,18 +333,23 @@ def check_same_job(runs: list[RunRef], *, allow_mixed: bool = False,
 # ---------------------------------------------------------------------------
 
 
-def ttft_parity(runs: list[RunRef], *, exclude_warmup: bool = True) -> list[dict]:
+def ttft_parity(runs: list[RunRef], *, exclude_warmup: bool = True,
+               exclude_void: bool = True) -> list[dict]:
     """Which token each arm's TTFT was stamped on.
 
     Returns one entry per arm: ``{"arm", "kind", "index_median", "source"}``;
     ``kind`` comes from the configured ``ttft_token`` knob when present,
     otherwise ``"any"``. A reasoning parser on one arm and not the other
     shifts TTFT by a decode step; the caller warns when ``index_median``
-    or ``kind`` differ across arms.
+    or ``kind`` differ across arms. Void runs are left out like warm-up
+    reps (issue #17): they are not in the table, so they must not steer
+    its warnings either.
     """
     per_arm: dict[str, list[RunRef]] = {}
     for r in runs:
         if exclude_warmup and r.warmup:
+            continue
+        if exclude_void and r.is_void():
             continue
         per_arm.setdefault(r.arm, []).append(r)
     out = []

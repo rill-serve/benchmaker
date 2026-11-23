@@ -115,3 +115,37 @@ async def test_sglang_meta_info_cached_tokens_classified():
     assert s.meta["cache_class"] == "device_hit" and s.extra["cached_ratio"] == 1.0
 
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Hint vocabulary (issue #17)                                                 #
+# --------------------------------------------------------------------------- #
+
+async def test_cache_hint_vocabulary_is_words_not_substrings():
+    """``dram`` is host memory (a restore tier) — ``host_dram`` must never read
+    as a device hit; ``localhost`` is not ``local``; a hint naming no known
+    tier is ``unknown`` rather than a guessed ``device_hit``."""
+    from benchmaker.workloads.llm import hint_tier, hint_words
+
+    assert hint_words("host_dram") == {"host", "dram"} and hint_words("HostDram") == {"host", "dram"}
+    assert hint_words("HOST-DRAM") == {"host", "dram"} and hint_words("gpu_v2") == {"gpu", "v", "2"}
+    assert hint_tier("host_dram") == "restore" and hint_tier("HostDram") == "restore"
+    assert hint_tier("HOST-DRAM") == "restore" and hint_tier("remote_gpu") == "restore"
+    assert hint_tier("local_gpu") == "device" and hint_tier("device") == "device"
+    assert hint_tier("localhost") == "unknown" and hint_tier("kv_cache") == "unknown"
+    assert hint_tier("none") is None and hint_tier("") is None and hint_tier(None) is None
+
+    wt = OpenAIChatWorkloadType(url="http://x", model="m")
+    for hint, expected in [("host_dram", "restore"), ("HostDram", "restore"), ("dram", "restore"),
+                           ("local_gpu", "device_hit"), ("gpu", "device_hit"), ("none", "device_hit"),
+                           ("l2", "unknown"), ("restored", "restore"), ("mixed", "restore")]:
+        s = await wt.make_sample("hi", await wt.make_request("hi"), _cached(100, hint=hint), 0.0)
+        assert s.meta["cache_class"] == expected, (hint, s.meta)
+        assert s.meta["cache_hint"] == hint
+    # a partial hit with an unknown-tier hint is still `partial`: the ratio decides
+    s = await wt.make_sample("hi", await wt.make_request("hi"), _cached(60, hint="l2"), 0.0)
+    assert s.meta["cache_class"] == "partial"
+    # the words win over the old substring rule even with a device word present
+    s = await wt.make_sample("hi", await wt.make_request("hi"),
+                             _cached(100, header={"X-Cache-Source": "host_dram"}), 0.0)
+    assert s.meta["cache_class"] == "restore"

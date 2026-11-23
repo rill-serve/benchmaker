@@ -150,3 +150,32 @@ def test_sglang_recipe_runs():
         assert res.exit_code == 0, res.output
     finally:
         loop.call_soon_threadsafe(loop.stop); t.join(timeout=5)
+
+
+async def test_itl_is_per_token_from_cumulative_counts():
+    """meta_info.completion_tokens is cumulative: its deltas give the exact
+    tokens per event, so a read that delivered several events splits its gap
+    over them instead of charging it all to the first (issue #17)."""
+    from benchmaker.core.metrics import ITL_SERIES
+    wt = _wt()
+    evs = [
+        (1, "a", 0.100),
+        (3, "a b c", 0.160),        # 2 new tokens, read together with the next event
+        (5, "a b c d e", 0.1601),   # 2 more, same read
+        (6, "a b c d e f", 0.260),
+    ]
+    chunks = [("data: " + json.dumps({"text": t, "meta_info": {
+        "prompt_tokens": 5, "completion_tokens": ct, "cached_tokens": 0, "finish_reason": None}}) + "\n\n").encode()
+        for ct, t, _ in evs]
+    times = [t for _, _, t in evs]
+    resp = Response(status=200, headers={}, body=b"", elapsed_s=times[-1], ok=True,
+                    stream_chunks=chunks, stream_chunk_times=times)
+    sample = await wt.make_sample("hi", Request(), resp, 0.0)
+    assert sample.meta["itl_mode"] == "per_token" and sample.extra["tokens_out"] == 6.0
+    # 4 tokens arrived in one read 60 ms after the first: 15 ms each; then 100 ms
+    assert sample.series[ITL_SERIES] == pytest.approx([15.0] * 4 + [100.0], abs=1e-3)
+    assert sample.extra["itl_ms_mean"] == pytest.approx(32.0, abs=1e-3)
+    assert sample.extra["itl_coalesced_events"] == 1.0
+    # the old per-event gaps, kept for comparison: (60 + 0.1 + 99.9) / 3
+    assert sample.extra["itl_chunk_ms_mean"] == pytest.approx(53.33, abs=0.01)
+

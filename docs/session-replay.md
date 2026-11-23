@@ -46,6 +46,20 @@ Session starts, exactly one of:
 `--think-median-s` overrides the manifest's median, so one prompt set (one hash) serves a whole think-time sweep.
 Turns within a session always keep their dependency.
 
+Sessions are admitted in `at_s` order whatever order the file lists them in:
+admission walks the list and stops at the first session whose time has not
+come, so a file that was not sorted would otherwise have held back every
+session behind a late one (issue #16). A turn that raises — `make_request`
+refusing a row, a `RoutingError`, a hook failing — is recorded as a failed
+sample *through the post-hooks*, so the session's slot is released and the
+next turn (and the next session) proceed; before #16 such a turn left the
+session wedged until the load model's time limit.
+
+Routing (issue #15): with an `endpoints:` map, each row's `model` label
+selects its server; every label in the (filtered) file must have an
+endpoint, which `build_config` checks up front, and `--model-label` is the
+way to replay one model's sessions.
+
 `--template-check` (default on when the manifest has a `probe`) sends the probe conversation once with
 `max_tokens: 1` and refuses to run if the server's `usage.prompt_tokens` differs from the count prepared offline:
 the server renders a different chat template or thinking mode than the file was prepared with.

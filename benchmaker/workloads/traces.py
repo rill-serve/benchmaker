@@ -29,7 +29,6 @@ import csv
 import gzip
 import io
 import json
-import logging
 import os
 import zipfile
 from dataclasses import dataclass, field
@@ -38,8 +37,6 @@ from typing import Any, Iterable, Optional
 
 from benchmaker.workloads import _tokens
 from benchmaker.workloads.datasets import Workload
-
-_logger = logging.getLogger(__name__)
 
 MOONCAKE_BLOCK_SIZE = 512  # tokens per hash block in the published trace
 
@@ -123,18 +120,22 @@ def _detect_ts_unit(values: list[float]) -> str:
 def _limit(records: list[TraceRecord], *, max_records: Optional[int],
            max_duration_s: Optional[float], max_input_tokens: Optional[int],
            max_output_tokens: Optional[int], max_seq: Optional[int] = None,
-           dropped: Optional[dict[str, int]] = None) -> list[TraceRecord]:
+           unique_tail: int = 0, dropped: Optional[dict[str, int]] = None) -> list[TraceRecord]:
     """Apply the size/duration limits. Rows removed by ``max_input_tokens``,
-    ``max_output_tokens`` or ``max_seq`` are counted in ``dropped`` by reason
-    (``max_duration`` / ``max_records`` only truncate the stream)."""
+    ``max_output_tokens`` or ``max_seq`` are counted in ``dropped`` by reason;
+    the rows ``max_duration`` / ``max_records`` cut off the stream are counted
+    too (issue #16). ``unique_tail`` is appended to the prompt actually sent,
+    so ``max_seq`` is checked against ``input + unique_tail + output`` — a row
+    near the limit would otherwise be sent oversized and come back as a 400."""
     dropped = dropped if dropped is not None else {}
 
-    def _drop(reason: str) -> None:
-        dropped[reason] = dropped.get(reason, 0) + 1
+    def _drop(reason: str, n: int = 1) -> None:
+        dropped[reason] = dropped.get(reason, 0) + n
 
     out = []
-    for r in records:
+    for i, r in enumerate(records):
         if max_duration_s is not None and r.t_s > max_duration_s:
+            _drop("max_duration", len(records) - i)
             break
         if max_input_tokens is not None and r.input_tokens > max_input_tokens:
             _drop("max_input_tokens")
@@ -142,13 +143,30 @@ def _limit(records: list[TraceRecord], *, max_records: Optional[int],
         if max_output_tokens is not None and r.output_tokens > max_output_tokens:
             _drop("max_output_tokens")
             continue
-        if max_seq is not None and r.input_tokens + r.output_tokens > max_seq:
+        if max_seq is not None and r.input_tokens + unique_tail + r.output_tokens > max_seq:
             _drop("max_seq")
             continue
-        out.append(r)
         if max_records is not None and len(out) >= max_records:
-            break
+            _drop("max_records")
+            continue
+        out.append(r)
     return out
+
+
+def _block_usage(inp: int, hashes: tuple, block_size: int, stats: dict) -> None:
+    """Count how a row's hash blocks were (or will be) used: blocks are full
+    ``block_size``-token units, so the last one may be rendered short, rows
+    longer than their blocks get a request-unique padded tail, and trailing
+    hash ids beyond the input are never rendered (issue #16)."""
+    stats["rows_with_hashes"] += 1
+    used = -(-inp // block_size)  # ceil
+    if used > len(hashes):
+        stats["padded_rows"] += 1
+    else:
+        if used < len(hashes):
+            stats["unused_blocks"] += len(hashes) - used
+        if inp % block_size:
+            stats["short_last_block_rows"] += 1
 
 
 def load_mooncake_trace(path: str, *, timestamp_unit: str = "ms",
@@ -158,6 +176,7 @@ def load_mooncake_trace(path: str, *, timestamp_unit: str = "ms",
                         max_input_tokens: Optional[int] = None,
                         max_output_tokens: Optional[int] = None,
                         max_seq: Optional[int] = None,
+                        unique_tail: int = 0,
                         stats: Optional[dict] = None) -> list[TraceRecord]:
     """Load the Mooncake trace (JSONL / JSONL.gz / parquet).
 
@@ -167,8 +186,9 @@ def load_mooncake_trace(path: str, *, timestamp_unit: str = "ms",
     units. Records are sorted by arrival time.
 
     ``max_seq`` (the server's ``max_model_len``) drops rows whose
-    ``input + output`` would not fit; ``stats`` (an optional dict) receives
-    ``{"rows", "kept", "dropped": {reason: n}}`` for the run manifest.
+    ``input + unique_tail + output`` would not fit; ``stats`` (an optional
+    dict) receives ``{"rows", "kept", "dropped": {reason: n}, "blocks":
+    {...}}`` for the run manifest (issue #11, #16).
     """
     lower = path.lower()
     rows: list[dict] = []
@@ -216,6 +236,8 @@ def load_mooncake_trace(path: str, *, timestamp_unit: str = "ms",
 
     records: list[TraceRecord] = []
     dropped: dict[str, int] = {}
+    blocks = {"rows_with_hashes": 0, "padded_rows": 0, "unused_blocks": 0,
+              "short_last_block_rows": 0}
     for item in parsed:
         if item is None:
             dropped["malformed"] = dropped.get("malformed", 0) + 1
@@ -224,9 +246,8 @@ def load_mooncake_trace(path: str, *, timestamp_unit: str = "ms",
         if inp <= 0:
             dropped["zero_input"] = dropped.get("zero_input", 0) + 1
             continue
-        if hashes and inp > len(hashes) * block_size:
-            _logger.debug("mooncake: input_length %d exceeds %d blocks x %d; tail is padded",
-                          inp, len(hashes), block_size)
+        if hashes:
+            _block_usage(inp, hashes, block_size, blocks)
         records.append(TraceRecord(
             t_s=(ts - t0) * scale, input_tokens=inp, output_tokens=max(out, 1),
             hash_ids=hashes, meta={"block_size": block_size},
@@ -234,9 +255,10 @@ def load_mooncake_trace(path: str, *, timestamp_unit: str = "ms",
     records.sort(key=lambda r: r.t_s)
     records = _limit(records, max_records=max_records, max_duration_s=max_duration_s,
                      max_input_tokens=max_input_tokens, max_output_tokens=max_output_tokens,
-                     max_seq=max_seq, dropped=dropped)
+                     max_seq=max_seq, unique_tail=unique_tail, dropped=dropped)
     if stats is not None:
-        stats.update({"rows": len(rows), "kept": len(records), "dropped": dropped})
+        stats.update({"rows": len(rows), "kept": len(records), "dropped": dropped,
+                      "blocks": blocks})
     return records
 
 
@@ -262,6 +284,7 @@ def load_azure_trace(path: str, *, max_records: Optional[int] = None,
                      max_input_tokens: Optional[int] = None,
                      max_output_tokens: Optional[int] = None,
                      max_seq: Optional[int] = None,
+                     unique_tail: int = 0,
                      stats: Optional[dict] = None) -> list[TraceRecord]:
     """Load ``AzureLLMInferenceTrace_*.csv`` (optionally gzipped).
 
@@ -298,7 +321,7 @@ def load_azure_trace(path: str, *, max_records: Optional[int] = None,
     records.sort(key=lambda r: r.t_s)
     records = _limit(records, max_records=max_records, max_duration_s=max_duration_s,
                      max_input_tokens=max_input_tokens, max_output_tokens=max_output_tokens,
-                     max_seq=max_seq, dropped=dropped)
+                     max_seq=max_seq, unique_tail=unique_tail, dropped=dropped)
     if stats is not None:
         stats.update({"rows": len(rows), "kept": len(records), "dropped": dropped})
     return records
@@ -390,7 +413,7 @@ class TraceReplayWorkload(Workload):
                  vocab_size: Optional[int] = None, exclude_ids: Any = (),
                  exclude_last: int = 0, source: Optional[str] = None,
                  path: Optional[str] = None, dropped: Optional[dict] = None,
-                 max_seq: Optional[int] = None):
+                 max_seq: Optional[int] = None, blocks: Optional[dict] = None):
         if not records:
             raise ValueError("trace has no records")
         if send not in ("text", "token_ids"):
@@ -421,11 +444,13 @@ class TraceReplayWorkload(Workload):
         self._max_tokens = max_tokens
         self._loop = loop
         self._i = 0
+        self._pass = 0  # loop pass (issue #16): request-unique content is re-seeded per pass
         self._cache: dict[tuple, Any] = {}
         # provenance for the manifest
         self._source = source
         self._path = path
         self._dropped = dict(dropped or {})
+        self._blocks = dict(blocks or {})
         self._max_seq = max_seq
 
     # -- provenance -------------------------------------------------------
@@ -471,11 +496,15 @@ class TraceReplayWorkload(Workload):
 
     def provenance(self) -> dict:
         """What the run manifest records under ``prompt_set.provenance``: the
-        replay parameters and the rows dropped by each limit (issue #11)."""
-        return {
+        replay parameters, the rows dropped or cut off by each limit and how
+        the hash blocks were used (issue #11, #16)."""
+        out = {
             "source": self._source, "path": self._path, "records": len(self._records),
-            **self._params(), "dropped": dict(self._dropped),
+            **self._params(), "dropped": dict(self._dropped), "loop": self._loop,
         }
+        if self._blocks:
+            out["blocks"] = dict(self._blocks)
+        return out
 
     def set_namespace(self, namespace: Optional[str]) -> None:
         """Called by ``build_config`` to resolve ``namespace: model``; must happen
@@ -497,12 +526,16 @@ class TraceReplayWorkload(Workload):
 
     def _request_block(self, index: int, kind: str, n_tokens: int):
         """Request-unique content: ``kind`` is ``""`` (no hashes), ``"tail"``
-        (input longer than its blocks) or ``"unique"`` (``unique_tail``)."""
-        key = ("req", self.namespace, index, kind, n_tokens)
+        (input longer than its blocks) or ``"unique"`` (``unique_tail``).
+        Seeded per loop pass so a second pass over the trace does not resend
+        the first pass's "unique" tails — whole-prompt duplicates would come
+        back as full cache hits (issue #16)."""
+        pas = self._pass
+        key = ("req", self.namespace, pas, index, kind, n_tokens)
         hit = self._cache.get(key)
         if hit is None:
-            seed = ((self.name, self.namespace, kind, index) if self.namespace
-                    else ((self.name, index) if kind == "" else (self.name, kind, index)))
+            seed = ((self.name, self.namespace, kind, index, pas) if self.namespace
+                    else ((self.name, index, pas) if kind == "" else (self.name, kind, index, pas)))
             hit = self._ids.block(seed, n_tokens) if self._ids is not None else self._sizer.block(seed, n_tokens)
             self._cache[key] = hit
         return hit
@@ -547,6 +580,10 @@ class TraceReplayWorkload(Workload):
             if not self._loop:
                 raise StopAsyncIteration
             self._i = 0
+            self._pass += 1
+            # Request-unique blocks are re-seeded per pass; drop the previous
+            # pass's so a long ``loop: true`` run does not grow without bound.
+            self._cache = {k: v for k, v in self._cache.items() if k[0] != "req"}
         rec = self._records[self._i]
         index = self._i
         self._i += 1
@@ -562,6 +599,7 @@ class TraceReplayWorkload(Workload):
             "trace_blocks": len(rec.hash_ids),
             "prompt_tokens_hint": rec.input_tokens + self._unique_tail,
             "trace_unique_tail": self._unique_tail,
+            **({"trace_pass": self._pass} if self._loop else {}),
             **({"trace_meta": rec.meta} if rec.meta else {}),
         }
         if self._ids is not None:
@@ -583,6 +621,9 @@ def trace_replay_from_spec(spec: dict) -> TraceReplayWorkload:
     load_keys = ("timestamp_unit", "max_records", "max_duration_s", "max_input_tokens",
                  "max_output_tokens", "block_size", "max_seq")
     load_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if k in load_keys}
+    # unique_tail is sent as part of the prompt, so max_seq must account for
+    # it at load time (issue #16).
+    load_kwargs["unique_tail"] = int(kwargs.get("unique_tail") or 0)
     stats: dict = {}
     records = load_trace(path, source=source, stats=stats, **load_kwargs)
     if source == "auto":
@@ -590,7 +631,7 @@ def trace_replay_from_spec(spec: dict) -> TraceReplayWorkload:
     name = kwargs.pop("name", None) or f"{source}:{os.path.basename(path)}"
     return TraceReplayWorkload(
         records, name=name, source=source, path=path, dropped=stats.get("dropped"),
-        max_seq=load_kwargs.get("max_seq"), **kwargs)
+        max_seq=load_kwargs.get("max_seq"), blocks=stats.get("blocks"), **kwargs)
 
 
 def MooncakeTraceWorkload(path: str, **kwargs: Any) -> TraceReplayWorkload:  # noqa: N802

@@ -105,14 +105,24 @@ decides how many there are per arm:
 
 | `relaunch`   | `start` runs                                   | `stop` runs                                                 |
 | ------------ | ---------------------------------------------- | ----------------------------------------------------------- |
-| `once`       | before the arm's first rep                     | after the arm's last rep — i.e. at the end of the run         |
+| `once`       | before the arm's first rep                     | after the arm's last rep, in plan order                      |
 | `every_rep`  | before every rep                               | after every rep                                              |
 | `visit`      | before every *contiguous run* of the arm's reps in the plan | when the next plan entry is another arm, so the GPUs are free before it starts |
 
 In ABBA order (`A B B A …`) `visit` gives `A↑ A₀ A↓ B↑ B₀ B₁ B↓ A↑ A₁ A↓`:
 both arms fit on the same GPUs, each is torn down before the other needs
-them, and the comparison still interleaves in time. An arm with no `start`
-but a `stop` also works (you start it by hand, benchmaker stops it).
+them, and the comparison still interleaves in time. With `once` the plan is
+`A↑ B↑ A₀ B₀ B₁ A₁ B↓ A↓`: **both servers are up at the same time** while
+the other arm's reps run — the right choice when they do not share GPUs
+(and you want to skip the restart cost), the wrong one when they do: each
+arm's numbers then include the other's memory footprint and any background
+load. The runner warns at start when two managed arms overlap this way
+(`arms a and b will both be live ... use relaunch: visit or every_rep`),
+`--dry-run` prints the same note, and `plan.json` records, for every plan
+entry, whether a stop follows (`stops_after`) plus the list of `overlaps`
+(issue #14). An arm with no `start` but a `stop` also works (you start it
+by hand, benchmaker stops it); an arm with neither is never "live" and so
+never overlaps.
 
 Both hooks run through the shell from the working directory with a timeout
 (`launch_timeout_s` / `stop_timeout_s`; a hung hook is killed with its whole
@@ -127,10 +137,15 @@ Failure handling:
 | What fails                | What happens                                                                                       |
 | ------------------------- | -------------------------------------------------------------------------------------------------- |
 | `start` exits non-zero    | `stop` runs (cleanup), then the whole run aborts — nothing of this arm was measured yet.           |
-| `ready_check` never passes| The rep runs anyway (so you see what an unready server does) but is **void**: `meta.void: true`, `meta.void_violations: [{rule: ready_check, …}]`, excluded from the table. The launch is stopped afterwards as usual. |
-| `stop` exits non-zero     | Recorded (`meta.hooks.stop.ok: false`) and warned about; the rep keeps its verdict.               |
+| `ready_check` never passes| **Every rep of the launch** is void (`meta.void_violations: [{rule: ready_check, …}]`), not only the first one that reused it: the reps still run (so you see what an unready server does) but none of them reaches the table. The launch is stopped afterwards as usual. |
+| `stop` exits non-zero     | Recorded (`meta.hooks.stop.ok: false`), warned about, and — with `stop_failure_voids` (default `true`) — every rep of the launch is **void**: a server that failed to stop was likely also failing in other ways (issue #14). Set `stop_failure_voids: false` to keep the reps and only get the warning. |
 | `post_stop_check` fails   | The launch's reps are **void** after the fact (a server that did not go away makes the next arm's numbers meaningless): `patch_bundle` rewrites `meta`/`summary` of each bundle written under the launch, and the comparison reloads them. |
+| Ctrl-C while `start` runs | The hook process group is killed (hooks are polled every 250 ms for cancellation, not waited out to `launch_timeout_s`), the arm counts as live so its `stop` hook runs in `finally`, and nothing of the server is left behind (issue #14). |
 | A rep raises / Ctrl-C     | Every live arm's `stop` runs in the runner's `finally` before the error propagates.                |
+
+The end-of-run teardown (`finally`) logs to `stop-final.log`; a stop that
+follows from the plan (`visit`, `every_rep`, or `once` after its last
+entry) is a regular `stop-rep-<k>.log` of the entry it follows.
 
 `ready_check` / `post_stop_check` accept `urls` (or a single `url`) with the
 expected `status` (default 200; connection refused counts as 0), a shell
@@ -161,16 +176,41 @@ mix:
     - {name: big,   workload: {type: static, items: ["ho"]}, rate: 2, model: qwen2.5-32b}
 ```
 
-A request's body `model` — set by its lane's `model`, or carried by a
-workload item — selects the endpoint; the request is re-routed to it (the
-endpoint's `headers` are added) and stamped `meta.model` / `meta.endpoint`.
+A request's model — set by its lane's `model`, a session-replay/trace row's
+`model` label, or carried by a workload item — selects the endpoint; the
+request is re-routed to it (the endpoint's `headers` are added) and stamped
+`meta.model` / `meta.endpoint`. The key is the name requests carry; an
+endpoint entry may add `model: <served-name>` to rewrite the body's `model`
+when the key is an alias (`small: {url: ..., model: qwen2.5-7b}`).
 `group_by: [model]` is added automatically, so the summary (and every
 lane/phase block) has per-model groups next to the arm aggregate. Capability
 snapshots, `void_rules` and the manifest run **per endpoint**:
 `capability.<model>.{start,end}.json` in the bundle (`read_bundle()` →
 `capability.endpoints`), `manifest.endpoints[model]` with each server's URL
-and reported model/revision. A lane whose `model` has no endpoint is a
-config error.
+and reported model/revision.
+
+**Nothing falls back to the default URL (issue #15).** With `endpoints:` set
+every model a request can carry must name an endpoint, and `build_config`
+checks this up front: the workload type's own `model` (a lane without
+`model` sends it), each lane's `model`, and every distinct `model` label of
+a session-replay or trace workload (`workload ... has rows labelled [...] with
+no endpoint`) — filter the workload (`model_label:`) or add the endpoints.
+A request that still slips through (`RoutingError`, e.g. a hook that rewrites
+the body) is failed, counted (`routing_unmatched`), logged once, and the rep
+is voided with a `routing` violation; it is never sent to `workload_type.url`.
+
+Void rules apply **per endpoint**: an unscoped rule is checked against every
+endpoint's snapshot; a rule with `endpoint: <model>` (or a path written
+`endpoints.<model>.<rest>`) only against that one — so a rule for the small
+model's fallbacks does not void the big model's reps, and vice versa. A
+scoped rule that names no configured endpoint is a config error. Each
+endpoint is captured even without an explicit `capability` URL: the shared
+`capability.url` with scheme/host swapped, else the OpenAI-style `/v1/models`
+listing next to its request URL (`capability: {enabled: false}` skips it);
+the violation records the endpoint it came from.
+
+Decomposition and TTFT parity (see [metrics.md](metrics.md)) ignore void
+reps the same way the table does (issue #17).
 ## Running
 
 ```bash

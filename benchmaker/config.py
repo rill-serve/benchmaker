@@ -20,7 +20,7 @@ import importlib
 from typing import Any, Callable, Optional
 
 from benchmaker.env import interpolate, load_dotenv
-from benchmaker.core.capability import parse_void_rules
+from benchmaker.core.capability import parse_void_rules, validate_rule_scopes
 from benchmaker.core.endpoints import normalize_endpoints
 from benchmaker.core.load import TraceArrivalsLoad, parse_duration, parse_rate_spec
 from benchmaker.core.monitors import FunctionMonitor, Monitor, PrometheusMonitor
@@ -477,10 +477,13 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
             post_hooks = list(post_hooks) + [wl_hook]
 
     endpoints = normalize_endpoints(cfg.get("endpoints"))
+    void_rules = parse_void_rules(cfg.get("void_rules"))
     group_by = [str(k) for k in (cfg.get("group_by") or [])]
     if endpoints and "model" not in group_by:
         # Per-model summaries next to the arm aggregate (issue #8).
         group_by.append("model")
+    # A void rule scoped to an endpoint must name one (issue #15).
+    validate_rule_scopes(void_rules, sorted(endpoints))
     _check_workloads(workload_type, endpoints,
                      [(workload, None)] + [(ln.workload, ln.model) for ln in lanes]
                      + [(pl.workload, pl.model) for ph in phases for pl in ph.lanes])
@@ -509,7 +512,7 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
         warmup_s=float(_opt_duration(cfg.get("warmup_s", cfg.get("warmup", 0.0)))),
         phases=phases,
         capability=cfg.get("capability") or None,
-        void_rules=parse_void_rules(cfg.get("void_rules")),
+        void_rules=void_rules,
         model_revision=(str(cfg["model_revision"]) if cfg.get("model_revision") else None),
         record_env=[str(k) for k in (cfg.get("record_env") or [])],
         endpoints=endpoints,
@@ -518,9 +521,18 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
 
 def _check_workloads(workload_type: WorkloadType, endpoints: dict,
                      pairs: list[tuple[Workload, Optional[str]]]) -> None:
-    """Cross-checks that need both sides (issue #11): token-id replay needs a
-    completions workload-type, and ``namespace: model`` resolves to the model
-    the lane (or workload-type) targets."""
+    """Cross-checks that need both sides (issue #11, #15): token-id replay
+    needs a completions workload-type, ``namespace: model`` resolves to the
+    model the lane (or workload-type) targets, and with ``endpoints:`` every
+    model a request can carry — the workload type's default, a lane's, a
+    row's own ``model`` label — names an endpoint, so nothing is left to
+    fail at request time (issue #15)."""
+    wt_model = getattr(workload_type, "model", None)
+    if endpoints and isinstance(wt_model, str) and wt_model not in endpoints:
+        raise ValueError(
+            f"workload_type model {wt_model!r} has no endpoint (have: {sorted(endpoints)}); with "
+            "'endpoints:' every request's model must map to an endpoint (a lane without "
+            "a `model` sends the workload_type's)")
     for wl, lane_model in pairs:
         if wl is None:
             continue
@@ -530,12 +542,25 @@ def _check_workloads(workload_type: WorkloadType, endpoints: dict,
                 "/v1/chat/completions does not accept; use workload_type "
                 "{type: openai-completions, url: .../v1/completions}")
         if getattr(wl, "namespace", None) == "model":
-            model = lane_model or getattr(workload_type, "model", None)
+            model = lane_model or wt_model
             if not model:
                 raise ValueError("namespace: model needs a lane `model` or workload_type `model`")
             wl.set_namespace(model)
-        if endpoints and lane_model and lane_model not in endpoints:
+        if not endpoints:
+            continue
+        if lane_model and lane_model not in endpoints:
             raise ValueError(f"lane model {lane_model!r} has no endpoint (have: {sorted(endpoints)})")
+        labels = {str(lbl) for lbl in (getattr(wl, "model_labels", None) or set())}
+        missing = sorted(lbl for lbl in labels if lbl not in endpoints)
+        if missing:
+            raise ValueError(
+                f"workload {getattr(wl, 'name', type(wl).__name__)!r} has rows labelled {missing} with no "
+                f"endpoint (have: {sorted(endpoints)}); add them to 'endpoints:' or filter the "
+                "workload (model_label: ...) so they are not replayed")
+        if lane_model and labels and lane_model not in labels:
+            raise ValueError(
+                f"lane model {lane_model!r} but its workload's rows are labelled {sorted(labels)}; "
+                "the lane's model wins the routing — filter the workload to match")
 
 
 def _opt_duration(v) -> Optional[float]:

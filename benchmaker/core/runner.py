@@ -15,9 +15,16 @@ from benchmaker.core.capability import (
     VoidRule,
     evaluate_void_rules,
     fetch_json,
+    hook_violation,
     merge_void_verdicts,
 )
-from benchmaker.core.endpoints import endpoint_model, route_url
+from benchmaker.core.endpoints import (
+    RoutingError,
+    default_capability_url,
+    endpoint_model,
+    route_url,
+    unroutable_model,
+)
 from benchmaker.core.load import LoadModel
 from benchmaker.core.metrics import DEFAULT_STALL_MS, ITL_SERIES, WARMUP_META_KEY, MetricsAggregator  # noqa: F401 (re-exported)
 from benchmaker.core.types import (
@@ -189,6 +196,8 @@ class BenchRunner:
         )
         self._fired = 0
         self.capability: Optional[dict[str, Any]] = None
+        self.routing_unmatched = 0  # requests whose model named no endpoint (issue #15)
+        self._warned_unrouted = False
 
     async def run(self) -> BenchResult:
         # httpx2 has no per-connector force_close / ttl_dns_cache knobs; pooling
@@ -224,30 +233,40 @@ class BenchRunner:
 
     def _summary(self) -> dict:
         summary = self.metrics.summary()
-        if self.capability is not None:
+        if (self.capability is not None or self.cfg.extra_void
+                or self.routing_unmatched):
             summary["capability"] = self.capability
             summary["void"] = self.void_verdict()
-        elif self.cfg.extra_void:
-            summary["void"] = self.void_verdict()
+        if self.cfg.endpoints:
+            summary["endpoints"] = self.cfg.endpoints
         return summary
 
     def void_verdict(self) -> dict:
         """``{"void", "violations", "checks"}`` over every endpoint's snapshots
-        (issue #8) plus any lifecycle violations recorded in ``cfg.extra_void``
-        (issue #9)."""
+        (issue #8; a rule scoped to one endpoint — ``endpoint:`` or an
+        ``endpoints.<model>.`` path — is only checked against that one,
+        issue #15) plus any lifecycle violations recorded in ``cfg.extra_void``
+        (issue #9) and requests that had no endpoint (issue #15)."""
         verdicts: list[dict] = []
         per = (self.capability or {}).get("endpoints")
         if per:
+            names = list(per)
             for name, snaps in per.items():
                 verdicts.append(evaluate_void_rules(
                     self.cfg.void_rules, snaps.get("start"), snaps.get("end"),
-                    endpoint=name).to_dict())
+                    endpoint=name, endpoints=names).to_dict())
         else:
             verdicts.append(evaluate_void_rules(
                 self.cfg.void_rules, (self.capability or {}).get("start"),
                 (self.capability or {}).get("end")).to_dict())
-        if self.cfg.extra_void:
-            verdicts.append({"void": True, "violations": list(self.cfg.extra_void), "checks": []})
+        extra = list(self.cfg.extra_void)
+        if self.routing_unmatched:
+            extra.append(hook_violation(
+                "routing",
+                f"{self.routing_unmatched} request(s) named a model with no endpoint and were not sent",
+            ))
+        if extra:
+            verdicts.append({"void": True, "violations": extra, "checks": []})
         return merge_void_verdicts(verdicts)
 
     def is_void(self) -> bool:
@@ -283,25 +302,43 @@ class BenchRunner:
             snapshot["endpoint"] = name
             per[name] = {**per.get(name, {}), at: snapshot}
             if not snapshot.get("ok"):
-                logger.warning("capability snapshot (%s, endpoint %s) failed: %s", at, name, snapshot.get("error"))
+                # A derived default URL is a guess; a URL the user typed is a promise.
+                (logger.info if cap.get("url_source") == "default" else logger.warning)(
+                    "capability snapshot (%s, endpoint %s) failed: %s (url %s; "
+                    "capability: {enabled: false} skips it)", at, name, snapshot.get("error"), cap["url"])
         self.capability = {**(self.capability or {}), "endpoints": per}
 
     def _capability_sources(self) -> list[tuple[Optional[str], dict]]:
         """``[(endpoint_name_or_None, {url, headers?, timeout_s?})]`` for every
-        endpoint that has a capability URL."""
+        endpoint that has a capability URL.
+
+        With an ``endpoints:`` map each endpoint is captured (issue #8): its
+        own ``capability`` URL, else the shared ``capability.url`` with
+        scheme/host swapped, else — so multi-server runs get model identity
+        and per-endpoint void rules without extra config — the OpenAI-style
+        ``models`` listing next to its request URL (``/v1/chat/completions``
+        -> ``/v1/models``). ``capability: {enabled: false}`` skips capture."""
         base = dict(self.cfg.capability or {})
+        if base.get("enabled") is False:
+            return []
         if not self.cfg.endpoints:
             return [(None, base)] if base.get("url") else []
         out = []
         for name, spec in self.cfg.endpoints.items():
-            cap = {**base, **{k: v for k, v in spec.items() if k != "url" and v}}
+            cap = {k: v for k, v in base.items() if k != "headers"}
+            cap.update({k: v for k, v in spec.items() if k not in ("url", "model") and v})
             if spec.get("capability"):
                 cap["url"] = spec["capability"]
+                cap["url_source"] = "endpoint"
             elif base.get("url"):
                 cap["url"] = route_url(spec["url"], base["url"])
+                cap["url_source"] = "shared"
+            else:
+                cap["url"] = default_capability_url(
+                    route_url(spec["url"], _workload_url(self.cfg.workload_type) or spec["url"]))
+                cap["url_source"] = "default"
             cap["headers"] = {**(base.get("headers") or {}), **(spec.get("headers") or {})}
-            if cap.get("url"):
-                out.append((name, cap))
+            out.append((name, cap))
         return out
 
     def _is_warmup(self, start_mono: float) -> bool:
@@ -494,21 +531,37 @@ class BenchRunner:
             load.on_complete()
 
     def _route(self, req: Request) -> None:
-        """Issue #8: with an endpoint map, the request's body ``model`` (a
-        lane's ``model``, or a workload item's) selects the server. The
-        endpoint's URL/headers are applied and the served model is stamped
-        into ``meta`` so per-model summaries (`group_by: [model]`) work."""
+        """Issue #8: with an endpoint map, the request's model (a lane's
+        ``model``, a row's ``model_label`` or the body ``model`` — see
+        ``endpoint_model``) selects the server. The endpoint's URL/headers
+        are applied and the served model is stamped into ``meta`` so
+        per-model summaries (`group_by: [model]`) work.
+
+        Issue #15: a request whose model names no endpoint is an error, not a
+        silent fall-back to ``workload_type.url`` — ``RoutingError`` fails the
+        request and ``void_verdict`` voids the rep."""
         if not self.cfg.endpoints:
             return
         name = endpoint_model(req.json, req.meta, self.cfg.endpoints)
         if name is None:
-            return
+            self.routing_unmatched += 1
+            model = unroutable_model(req.json, req.meta)
+            if not self._warned_unrouted:
+                self._warned_unrouted = True
+                logger.error("no endpoint for model %r (endpoints: %s); the request is failed and "
+                             "the rep voided (issue #15)", model, sorted(self.cfg.endpoints))
+            raise RoutingError(
+                f"no endpoint for model {model!r} (endpoints: {sorted(self.cfg.endpoints)}); "
+                "with 'endpoints:' every request's model must map to an endpoint")
         spec = self.cfg.endpoints[name]
         req.url = route_url(spec["url"], req.url)
         for k, v in spec.get("headers", {}).items():
             req.headers.setdefault(k, v)
         req.meta.setdefault("model", name)
         req.meta["endpoint"] = name
+        if spec.get("model") and isinstance(req.json, dict):
+            req.json["model"] = spec["model"]
+            req.meta["endpoint_model"] = spec["model"]
 
     async def _aclose_workloads(self) -> None:
         workloads: list[Workload] = []

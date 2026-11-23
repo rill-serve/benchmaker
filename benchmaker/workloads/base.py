@@ -11,10 +11,14 @@ Pairing:
 
 from __future__ import annotations
 
+import logging
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 from benchmaker.core.types import Request, Response, Sample, TicketContext, maybe_await
+
+_logger = logging.getLogger(__name__)
 
 
 class WorkloadType(ABC):
@@ -60,11 +64,15 @@ class WorkloadType(ABC):
         the shared httpx2 async client. Per-lane ``ctx.overrides`` are applied
         by :meth:`apply_overrides` right after the request is built.
         """
-        req = await self.make_request(ctx.item)
-        if ctx.overrides:
-            req = await maybe_await(self.apply_overrides(req, ctx.overrides))
-        resp = await ctx.fire(req)
-        sample = await self.make_sample(ctx.item, req, resp, ctx.start_mono)
+        req: Optional[Request] = None
+        try:
+            req = await self.make_request(ctx.item)
+            if ctx.overrides:
+                req = await maybe_await(self.apply_overrides(req, ctx.overrides))
+            resp = await ctx.fire(req)
+            sample = await self.make_sample(ctx.item, req, resp, ctx.start_mono)
+        except Exception as e:  # noqa: BLE001 - a failing turn must not wedge its session (#16)
+            return await failed_ticket(self, ctx, e, request=req)
         for hook in ctx.post_hooks:
             sample = await maybe_await(hook(req, resp, sample))
         return sample
@@ -86,6 +94,35 @@ class WorkloadType(ABC):
 
     async def aclose(self) -> None:
         return None
+
+
+async def failed_ticket(workload_type: WorkloadType, ctx: TicketContext, exc: BaseException,
+                       *, request: Optional[Request] = None) -> Sample:
+    """Record a turn that raised (in ``make_request``, ``make_sample``, a
+    pre-hook or ``ctx.fire``) as a failed sample — *through the post-hooks*
+    — instead of letting the exception escape (issue #16).
+
+    A workload that schedules on completion (session replay) installs its
+    completion hook as a post-hook; if the exception skipped the hooks the
+    session's slot would never be released and the run would only end at the
+    load model's time limit. Post-hook failures on this path are logged, not
+    raised, so every hook still sees the sample.
+    """
+    error = f"{type(exc).__name__}: {exc}"
+    latency = max(time.monotonic() - ctx.start_mono, 0.0)
+    resp = Response(status=0, headers={}, body=b"", elapsed_s=latency, ok=False, error=error)
+    sample = Sample(
+        start_ts=ctx.start_mono, latency_s=latency, status=0, ok=False, request_ok=False,
+        error=error, workload=workload_type.name,
+        meta=dict(request.meta) if request is not None else {},
+    )
+    for hook in ctx.post_hooks:
+        try:
+            sample = await maybe_await(hook(request, resp, sample))
+        except Exception as e:  # noqa: BLE001 - the sample is already failed; keep releasing
+            _logger.warning("%s: post-hook %r raised on a failed request: %s: %s",
+                            workload_type.name, getattr(hook, "__name__", hook), type(e).__name__, e)
+    return sample
 
 
 def _estimate_request_size(req: Request) -> int:

@@ -102,17 +102,26 @@ class MetricsAggregator:
         # excluded from every summary block (#5).
         warm = [s for s in self.samples if _is_warmup(s)]
         samples = [s for s in self.samples if not _is_warmup(s)]
-        out = _summary_for_samples(samples, wall_s, stall_ms=self.stall_ms)
+        # Throughput is measured over the window the measured requests
+        # actually span — first measured start to last measured completion —
+        # not the whole run: ramp-up, warm-up and a drained queue are not the
+        # server's steady state (issue #17). Latency and the other metrics
+        # are per request and need no window.
+        window_s, w_start, w_end = measured_window(samples, self.start_time, end)
+        out = _summary_for_samples(samples, window_s, stall_ms=self.stall_ms)
+        out["wall_time_s"] = wall_s
+        out["measured_window_s"] = window_s
+        out["measured_window"] = {"start_s": w_start - self.start_time, "end_s": w_end - self.start_time}
         if warm:
             out["warmup_excluded"] = len(warm)
 
         # A mixed benchmark needs each lane's SLO signal independently.  Use
-        # the same wall-clock interval as the aggregate so lane throughput is
-        # directly comparable to the total, while latency and workload metrics
-        # remain scoped to that lane's samples.
+        # the same window as the aggregate so lane throughput is directly
+        # comparable to the total, while latency and workload metrics remain
+        # scoped to that lane's samples.
         out["lanes"] = _grouped(
-            samples, "lane", wall_s, self.stall_ms, nested=("phase",))
-        _apply_group_by(out, samples, wall_s, self.group_by, self.stall_ms)
+            samples, "lane", window_s, self.stall_ms, nested=("phase",))
+        _apply_group_by(out, samples, window_s, self.group_by, self.stall_ms)
         if self.phase_windows:
             phases: dict[str, dict] = {}
             for name, (p_start, p_end) in self.phase_windows.items():
@@ -176,7 +185,12 @@ class MetricsAggregator:
         if s.get("warmup_excluded"):
             lines.append(f"  (excluding {s['warmup_excluded']} warm-up requests)")
         lines.append("=" * 60)
-        lines.append(f"  throughput     : {s['throughput_rps']:>10.2f} req/s")
+        window = s.get("measured_window_s")
+        if window and abs(window - s["wall_time_s"]) > 0.5:
+            lines.append(f"  throughput     : {s['throughput_rps']:>10.2f} req/s  "
+                         f"(over the measured {window:.2f}s of {s['wall_time_s']:.2f}s wall)")
+        else:
+            lines.append(f"  throughput     : {s['throughput_rps']:>10.2f} req/s")
         lines.append(f"  goodput        : {s['goodput_rps']:>10.2f} req/s")
         lines.append(f"  success        : {s['success']}")
         lines.append(f"  failed         : {s['failed']}  ({s['error_rate']*100:.2f}%)")
@@ -356,8 +370,32 @@ def _summary_for_samples(samples: list[Sample], wall_s: float,
         out[f"{key}_pooled"] = pooled_series_summary(pooled)
         if key == ITL_SERIES and stall_ms is not None:
             out["stalls"] = stall_summary(per_request, stall_ms)
+    # How the itl_ms gaps were counted (issue #17): per token (exact or
+    # estimated from the server's token counts) or per streamed event, with
+    # the coalesced-read and tokens-per-event figures that explain the two.
+    itl_samples = [s for s in ok if s.series.get(ITL_SERIES)]
+    if itl_samples:
+        out["itl_modes"] = {
+            "modes": dict(Counter(str(s.meta.get("itl_mode") or "per_event") for s in itl_samples)),
+            "usage_mismatch_requests": sum(1 for s in itl_samples if s.meta.get("itl_usage_mismatch")),
+            "coalesced_events_mean": statistics.mean(
+                float(s.extra.get("itl_coalesced_events", 0.0)) for s in itl_samples),
+            "tokens_per_event_mean": statistics.mean(
+                float(s.extra.get("itl_tokens_per_event_mean", 1.0)) for s in itl_samples),
+        }
 
     return out
+
+
+def measured_window(samples: list[Sample], start_time: float, end_time: float) -> tuple[float, float, float]:
+    """``(window_s, window_start, window_end)`` spanned by the measured
+    requests: the first one's start to the last one's completion. The whole
+    ``[start_time, end_time]`` when there is nothing to measure (issue #17)."""
+    if not samples:
+        return max(end_time - start_time, 1e-9), start_time, end_time
+    w_start = min(s.start_ts for s in samples)
+    w_end = max(s.start_ts + s.latency_s for s in samples)
+    return max(w_end - w_start, 1e-9), w_start, w_end
 
 
 def _apply_group_by(out: dict, samples: list[Sample], wall_s: float,
@@ -502,6 +540,12 @@ def _render_itl(s: dict) -> list[str]:
         for k in ("mean", "p50", "p90", "p99", "p995", "p999", "max"):
             label = "p99.5" if k == "p995" else "p99.9" if k == "p999" else k
             lines.append(f"    {label:<6}: {pooled[k]:.3f}")
+        modes = s.get("itl_modes")
+        if modes:
+            mix = "  ".join(f"{m}={n}" for m, n in sorted(modes["modes"].items()))
+            lines.append(f"    gaps per token : {mix}; {modes['coalesced_events_mean']:.2f} coalesced "
+                         f"events/request, {modes['tokens_per_event_mean']:.2f} tokens/event"
+                         + (f", {modes['usage_mismatch_requests']} requests with usage < events" if modes["usage_mismatch_requests"] else ""))
     stalls = s.get("stalls")
     if stalls and stalls["requests"]:
         lines.append(f"  decode stalls (gap > {stalls['threshold_ms']:g} ms)")

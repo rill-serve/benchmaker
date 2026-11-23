@@ -27,9 +27,8 @@ the raw per-token gaps, which the summary used to throw away.
 ### What is recorded
 
 For every streamed request the workload-type keeps the raw inter-token gap
-series on `Sample.series["itl_ms"]` (one value per decode step, measured on
-SSE chunk arrival). The aggregator then **pools** the observations of every
-successful request:
+series on `Sample.series["itl_ms"]` (one value per decode step). The
+aggregator then **pools** the observations of every successful request:
 
 ```python
 "workload_metrics": {
@@ -58,6 +57,38 @@ successful request:
     }
 }
 ```
+
+### Per-token, not per network read (issue #17)
+
+An SSE event is not a token. Servers batch tokens per event under load
+(vLLM/SGLang stream one chunk per scheduler step, often several tokens),
+and the client's network reads coalesce events that were produced apart.
+Measuring "ITL" as the gap between events therefore reported (a) how the
+server *batched* its output and (b) when the kernel woke the reader — an
+arm with a busier GPU looked *faster* because it emitted fewer, fatter
+events, with a 6 ms gap charged whole to the first token of a read and
+0 ms to the rest.
+
+`itl_ms` is now **per token**:
+
+- how many tokens each event carried comes from the server when it says so
+  — the final `usage.completion_tokens` (OpenAI-compatible types) or the
+  cumulative `meta_info.completion_tokens` on every event (sglang, exact);
+- with only the final count, the surplus over the number of events is
+  spread evenly (`itl_mode: per_token_estimated`); with more events than
+  tokens (a usage that excludes reasoning tokens, say) each event stays one
+  token and `itl_usage_mismatch` is set on the sample;
+- consecutive events closer than 0.2 ms came in one read: the read's gap
+  is divided by the read's token count instead of landing whole on its
+  first token.
+
+Each sample records `meta.itl_mode` (`per_token` / `per_token_estimated` /
+`per_event`), `itl_coalesced_events`, `itl_tokens_per_event_mean` and the
+old per-event gaps as `itl_chunk_ms_*`; the summary adds an `itl_modes`
+block (`modes: {per_token: 1180, per_event: 4}`, mean coalesced events and
+tokens per event) and the terminal render prints it under the pooled ITL.
+If `tokens_per_event_mean` drifts between arms, the server's event batching
+changed — not its decode speed.
 
 Three things to read off this block:
 
@@ -107,11 +138,23 @@ block the server returns (`prompt_tokens`, `cached_tokens`) into
 | `restore`     | a prefix was cached but had to be restored from a host/remote tier |
 | `partial`     | only part of the prefix was cached                              |
 | `miss`        | nothing cached (cold prefill)                                   |
+| `unknown`     | a full hit whose `cache_source` hint names a tier this module does not know (issue #17) |
+
+The tier comes from the server's own words — `cache_source` / `cache_tier` /
+`X-Cache-Source` in the usage block, `prompt_tokens_details` or headers —
+read as **whole words** (`host_dram`, `HostDram`, `HOST-DRAM` all split into
+`host` + `dram`; `hint_tier()`). `dram` is *host* memory, so `host_dram` is a
+restore tier and never a device hit; only `device`, `gpu`, `hbm`, `local`,
+`vram` are device tiers; restore words (`restore`, `remote`, `host`, `cpu`,
+`dram`, `mooncake`, `lmcache`, `hicache`, `ssd`, `mixed`, …) win over device
+words. A hint with no word from either list (`l2`, `kv_cache`, `localhost`)
+is `unknown` — recorded as such instead of a guessed `device_hit` — and
+`none` means "no tier information", leaving the ratio to decide.
 
 Which combination of `cached_tokens`/`prompt_tokens` means `device_hit` vs
 `restore` is server-specific. The default classifier uses a token-rate
-threshold (`CacheClassInfo` → `classify_cache`); pass your own for your
-server:
+threshold (`CacheClassInfo` → `classify_cache`); extend the vocabularies
+(`RESTORE_WORDS` / `DEVICE_WORDS`) or pass your own for your server:
 
 ```yaml
 workload_type:
@@ -181,6 +224,13 @@ From Python:
 from benchmaker.core.compare import decompose_ttft
 dec = decompose_ttft(summary_a, summary_b, key="cache_class")
 ```
+
+Void reps (failed readiness/stop checks, void rules) are left out of the
+decomposition and of the TTFT parity medians exactly as the table leaves
+them out (issue #17) — a rep voided for an unready server must not weigh on
+"how much of the TTFT delta is latency". (Before #17 the decomposition was
+silently skipped whenever an arm had two or more reps — the synthetic median
+summary it built could not be read back; fixed.)
 
 ## 3. TTFT parity (#4)
 
