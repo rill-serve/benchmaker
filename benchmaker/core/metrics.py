@@ -17,6 +17,11 @@ from benchmaker.core.types import Sample
 ITL_SERIES = "itl_ms"
 DEFAULT_STALL_MS = 12.0
 
+# Warm-up requests carry ``meta["warmup"] = True`` (set by a workload item or
+# by ``BenchConfig.warmup_requests`` / ``warmup_s``) and are left out of every
+# summary block (#5).
+WARMUP_META_KEY = "warmup"
+
 # Bucket label used for samples that lack a value for a ``group_by`` key.
 UNGROUPED = "(none)"
 
@@ -57,7 +62,9 @@ class MetricsAggregator:
     stall (issue #1). ``None`` disables the ``stalls`` block. ``group_by`` lists
     ``Sample.meta`` keys to break the summary down by (e.g. ``["cache_class"]``
     for per-cache-class TTFT, issue #2). ``dump_series`` writes each sample's
-    raw ``series`` (per-token gaps) into samples.jsonl.
+    raw ``series`` (per-token gaps) into samples.jsonl. ``phase_windows`` is
+    filled by the runner for phased runs (issue #5): phase name -> (start, end)
+    on the monotonic clock.
     """
 
     samples: list[Sample] = field(default_factory=list)
@@ -71,6 +78,7 @@ class MetricsAggregator:
     stall_ms: Optional[float] = DEFAULT_STALL_MS
     group_by: list[str] = field(default_factory=list)
     dump_series: bool = False
+    phase_windows: dict[str, tuple[float, float]] = field(default_factory=dict)
 
     def add(self, sample: Sample) -> None:
         self.samples.append(sample)
@@ -90,15 +98,41 @@ class MetricsAggregator:
         end = self.end_time or time.monotonic()
         wall_s = max(end - self.start_time, 1e-9)
 
-        samples = self.samples
+        # Warm-up requests are recorded (samples.jsonl keeps them, tagged) but
+        # excluded from every summary block (#5).
+        warm = [s for s in self.samples if _is_warmup(s)]
+        samples = [s for s in self.samples if not _is_warmup(s)]
         out = _summary_for_samples(samples, wall_s, stall_ms=self.stall_ms)
+        if warm:
+            out["warmup_excluded"] = len(warm)
 
         # A mixed benchmark needs each lane's SLO signal independently.  Use
         # the same wall-clock interval as the aggregate so lane throughput is
         # directly comparable to the total, while latency and workload metrics
         # remain scoped to that lane's samples.
-        out["lanes"] = _grouped(samples, "lane", wall_s, self.stall_ms)
+        out["lanes"] = _grouped(
+            samples, "lane", wall_s, self.stall_ms, nested=("phase",))
         _apply_group_by(out, samples, wall_s, self.group_by, self.stall_ms)
+        if self.phase_windows:
+            phases: dict[str, dict] = {}
+            for name, (p_start, p_end) in self.phase_windows.items():
+                bucket = [s for s in samples if s.meta.get("phase") == name]
+                if not bucket:
+                    continue
+                phase_wall = max(p_end - p_start, 1e-9)
+                sub = _summary_for_samples(bucket, phase_wall, stall_ms=self.stall_ms)
+                sub["lanes"] = _grouped(bucket, "lane", phase_wall, self.stall_ms)
+                # same breakdowns as the top level, so a per-phase cache-class
+                # table (capacity warm vs revisit) falls out of group_by (#2, #5)
+                _apply_group_by(sub, bucket, phase_wall, self.group_by, self.stall_ms)
+                # How long the phase was actually producing: a lane that
+                # exhausts its items closes the window early.
+                sub["active_s"] = max(s.start_ts + s.latency_s for s in bucket) - p_start
+                sub["start_s"] = p_start - self.start_time
+                sub["end_s"] = p_end - self.start_time
+                phases[name] = sub
+            if phases:
+                out["phases"] = phases
 
         # Monitor time-series: summarize each metric per monitor.
         if self.monitor_samples:
@@ -139,6 +173,8 @@ class MetricsAggregator:
         lines.append("=" * 60)
         lines.append(f"[benchmaker] results  ({s['total_requests']} requests, "
                      f"{s['wall_time_s']:.2f}s wall)")
+        if s.get("warmup_excluded"):
+            lines.append(f"  (excluding {s['warmup_excluded']} warm-up requests)")
         lines.append("=" * 60)
         lines.append(f"  throughput     : {s['throughput_rps']:>10.2f} req/s")
         lines.append(f"  goodput        : {s['goodput_rps']:>10.2f} req/s")
@@ -174,22 +210,21 @@ class MetricsAggregator:
                     lines.append(f"      {kk:<6}: {v[kk]:.4f}")
         lines.extend(_render_itl(s))
         lines.extend(_render_groups(s))
+        if s.get("phases"):
+            lines.append("")
+            lines.append("  phases")
+            for name, ph in s["phases"].items():
+                lines.append(
+                    f"    {name}: [{ph['start_s']:.1f}s .. {ph['end_s']:.1f}s] "
+                    f"{ph['total_requests']} requests, "
+                    f"{ph['throughput_rps']:.2f} req/s, "
+                    f"{ph['success']} success"
+                )
+                lines.extend(_render_lane_lines(ph, indent=6))
         if s.get("lanes"):
             lines.append("")
             lines.append("  lanes")
-            for name, lane in s["lanes"].items():
-                lines.append(
-                    f"    {name}: {lane['total_requests']} requests, "
-                    f"{lane['throughput_rps']:.2f} req/s, "
-                    f"{lane['success']} success"
-                )
-                for metric in ("ttft_s", "itl_ms_mean", "tokens_per_s"):
-                    values = lane.get("workload_metrics", {}).get(metric)
-                    if values:
-                        lines.append(
-                            f"      {metric}: p50={values['p50']:.4f}, "
-                            f"p99={values['p99']:.4f}"
-                        )
+            lines.extend(_render_lane_lines(s, indent=4))
         if s.get("monitors"):
             for mon_name, mon in s["monitors"].items():
                 lines.append("")
@@ -335,7 +370,7 @@ def _apply_group_by(out: dict, samples: list[Sample], wall_s: float,
 
 
 def _grouped(samples: list[Sample], key: str, wall_s: float,
-             stall_ms: Optional[float]) -> dict:
+             stall_ms: Optional[float], nested: tuple[str, ...] = ()) -> dict:
     """Bucket samples by ``meta[key]`` and summarize each bucket.
 
     Each bucket gets a ``share`` (fraction of requests) next to its own summary,
@@ -351,6 +386,10 @@ def _grouped(samples: list[Sample], key: str, wall_s: float,
     for value, bucket in buckets.items():
         sub = _summary_for_samples(bucket, wall_s, stall_ms=stall_ms)
         sub["share"] = len(bucket) / total if total else 0.0
+        for inner in nested:
+            inner_groups = _grouped(bucket, inner, wall_s, stall_ms)
+            if inner_groups:
+                sub[inner if inner != "lane" else "lanes"] = inner_groups
         out[str(value)] = sub
     return dict(sorted(out.items()))
 
@@ -360,6 +399,10 @@ def _group_value(sample: Sample, key: str) -> Any:
     if v is None or v == "":
         return UNGROUPED
     return v
+
+
+def _is_warmup(sample: Sample) -> bool:
+    return bool(sample.meta.get(WARMUP_META_KEY))
 
 
 # --------------------------------------------------------------------------- #
@@ -496,6 +539,25 @@ def _render_groups(s: dict) -> list[str]:
             lines.append(
                 f"    {value:<14} {g['share'] * 100:5.1f}% {g['total_requests']:>6}  {tt}"
             )
+    return lines
+
+
+def _render_lane_lines(s: dict, indent: int) -> list[str]:
+    lines: list[str] = []
+    pad = " " * indent
+    for name, lane in (s.get("lanes") or {}).items():
+        lines.append(
+            f"{pad}{name}: {lane['total_requests']} requests, "
+            f"{lane['throughput_rps']:.2f} req/s, "
+            f"{lane['success']} success"
+        )
+        for metric in ("ttft_s", "itl_ms_mean", "tokens_per_s"):
+            values = lane.get("workload_metrics", {}).get(metric)
+            if values:
+                lines.append(
+                    f"{pad}  {metric}: p50={values['p50']:.4f}, "
+                    f"p99={values['p99']:.4f}"
+                )
     return lines
 
 

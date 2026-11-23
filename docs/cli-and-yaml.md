@@ -387,6 +387,28 @@ mix:
       workload: {type: jsonl, path: .local/sharegpt_v3.jsonl}
       rate: sweep:8,2,8,2@60s
 
+# ---------- phases (alternative to workload+load and mix; docs/phases-capacity.md) ----------
+# Timed stages run back-to-back, each with its own lanes; samples get meta.phase.
+phases:
+  - name: warm
+    duration: 120s
+    lanes:
+      - name: warm
+        workload: {type: capacity, n_docs: 64, doc_tokens: 8192, stage: warm}
+        rate: 4
+  - name: revisit
+    duration: 120s
+    drain: true                      # let in-flight requests finish before the next phase
+    lanes:
+      - name: revisit
+        workload: {type: capacity, n_docs: 64, doc_tokens: 8192, stage: revisit}
+        rate: 4
+      - name: background
+        workload: {type: jsonl, path: .local/sharegpt_v3.jsonl, loop: true}
+        rate: poisson:6
+        model: other-model            # route this lane to another model on the endpoint
+        meta: {tier: background}      # extra tags stamped on every sample of the lane
+
 # ---------- hooks (optional) ----------
 pre_hooks:
   - my_pkg.hooks:sign_request
@@ -422,7 +444,9 @@ replay:
   streaming: false                   # match the original workload-type's streaming flag
 
 # ---------- measurement knobs (all optional; docs/itl-cache-metrics.md) ----------
-group_by: [cache_class]              # break the summary (and every lane) down by meta keys
+warmup_requests: 16                  # first N requests are warm-up: recorded, excluded from summaries
+warmup_s: 5s                         #   ... or everything fired in the first 5 s
+group_by: [cache_class, visit]       # break the summary (and every lane/phase) down by meta keys
 stall_ms: 12                         # inter-token gap above this is a decode stall ("none" disables)
 dump_series: false                   # write every sample's raw per-token series into samples.jsonl
 
@@ -469,6 +493,9 @@ progress_every_s: 1.0                # 0 disables progress output
   multi-passage QA JSONL. See [DeepRAG and mixed lanes](deeprag-mix.md).
 - `agentic` — `AgenticWorkload(...)`. Expand multi-turn trajectories
   into per-turn items. See [Agentic](agentic.md).
+- `capacity` (or `capacity-revisit`) — `CapacityRevisitWorkload(...)`: warm
+  pass over N long documents then revisit passes, tagged per visit. See
+  [Phases & capacity](phases-capacity.md).
 - `factory: 'module:fn'` — call `fn(**kwargs)`; must return a `Workload`.
 
 You can also write a workload as bare YAML for two shortcuts:

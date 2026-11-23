@@ -23,8 +23,18 @@
   `benchmaker run` exits 3). Every bundle now carries `manifest.json`
   (config hash, prompt-set content hash, model id/revision, host + Slurm/
   PBS/LSF/K8s job id, filtered env; `model_revision:` / `record_env:` keys).
-- Docs: `itl-cache-metrics.md`, `capability-manifest.md`; `cli-and-yaml.md`, `metrics.md`,
-  `workloads.md` updated.
+- **Phases, warm-up, capacity-revisit (#5):** `phases:` runs timed stages
+  back-to-back, each with its own lanes (own load model starting at the
+  phase's t=0, optional per-lane `model`/`meta`, `drain`), tags samples with
+  `meta.phase` and summarizes each phase (`summary.phases`, with `lanes` and
+  `groups` inside). `warmup_requests:` / `warmup_s:` exclude the first
+  requests from every summary while still recording them. New
+  `capacity` workload: a warm pass over N long documents (real JSONL or
+  synthesized, token-exact with `tokenizer:`) then K revisit passes (sequential
+  or seeded random), each visit tagged `visit`/`pass_index`/`doc_id`, with
+  `stage: warm|revisit` views for phased recipes.
+- Docs: `itl-cache-metrics.md`, `capability-manifest.md`, `phases-capacity.md`;
+  `cli-and-yaml.md`, `metrics.md`, `workloads.md` updated.
 - Added the `agentx` recipe and workload (`benchmaker agentx`, YAML `type:
   agentx`): the SemiAnalysis AgentX v1.0 agentic-coding benchmark
   (https://inferencex.semianalysis.com/agentx). Replays the public WEKA-format

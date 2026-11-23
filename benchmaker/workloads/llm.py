@@ -268,6 +268,13 @@ class OpenAIChatWorkloadType(WorkloadType):
                 item, meta_extra = self._split_passthrough(item)
             else:
                 item = dict(item)
+                # A workload item's ``meta`` (dataset tags: visit, doc_id,
+                # trace fields, ...) is provenance, not a request parameter:
+                # keep it out of the body and carry it on the request so it
+                # reaches ``sample.meta`` and the grouped summaries (#5, #6).
+                item_meta = item.pop("meta", None)
+                if isinstance(item_meta, dict):
+                    meta_extra.update(item_meta)
             # Promote "prompt" -> messages if no messages provided.
             if "messages" not in item and "prompt" in item:
                 item["messages"] = [{"role": "user", "content": item.pop("prompt")}]

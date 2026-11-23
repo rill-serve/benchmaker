@@ -96,6 +96,10 @@ class TicketContext:
     pre_hooks: tuple = ()
     post_hooks: tuple = ()
     workload_name: str = "workload-type"
+    # Per-lane request overrides (e.g. ``{"model": "other-model"}``): a
+    # multi-model phase can point one lane at a different model behind the
+    # same endpoint without building a second workload-type (#5).
+    overrides: dict[str, Any] = field(default_factory=dict)
 
 
 async def maybe_await(value: Any) -> Any:

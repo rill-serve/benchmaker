@@ -64,6 +64,9 @@ A benchmark in benchmaker is the composition of four things:
     `group_by: [cache_class]` per-class summaries.
 18. [Capability, manifest, void runs](capability-manifest.md) — server
     self-description before/after a run, `manifest.json`, and `void_rules`.
+19. [Phases, warm-up, capacity-revisit](phases-capacity.md) — timed stages
+    with their own lanes, excluded warm-up, and the warm/revisit workload
+    for measuring a working set larger than the device cache.
 
 ## Where things live
 

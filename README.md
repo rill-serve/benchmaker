@@ -165,6 +165,9 @@ Full docs live in [`docs/`](docs/):
   percentiles, stall accounting and per-cache-class summaries
 - [Capability, manifest, void runs](docs/capability-manifest.md) — server
   self-description snapshots, `manifest.json`, `void_rules`
+- [Phases, warm-up, capacity-revisit](docs/phases-capacity.md) — timed stages
+  with their own lanes, excluded warm-up, and the warm/revisit working-set
+  workload
 
 ## Deterministic replay (`swebench-replay`)
 

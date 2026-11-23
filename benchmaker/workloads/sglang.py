@@ -88,6 +88,13 @@ class SGLangGenerateWorkloadType(WorkloadType):
         """``/generate`` has no model field; the served model is the server's."""
         return None
 
+    def apply_overrides(self, req: Request, overrides: dict[str, Any]) -> Request:
+        # The SGLang body carries no model name; a per-lane model override can
+        # only be recorded as a label (the endpoint decides what is served).
+        if overrides.get("model"):
+            req.meta["model"] = overrides["model"]
+        return req
+
     @classmethod
     def from_env(
         cls,
@@ -126,6 +133,9 @@ class SGLangGenerateWorkloadType(WorkloadType):
             body["text"] = item
         elif isinstance(item, dict):
             item = dict(item)
+            item_meta = item.pop("meta", None)  # dataset tags -> sample.meta, not the body
+            if isinstance(item_meta, dict):
+                meta_extra.update(item_meta)
             if "text" in item:
                 body["text"] = item.pop("text")
             elif "input_ids" in item:

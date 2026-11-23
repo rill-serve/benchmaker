@@ -104,6 +104,9 @@ repeatedly on the CLI; pass `labels={...}` from Python.
     },
 
     # Optional blocks, each present only when the config asked for it:
+    "warmup_excluded": 16,              # warm-up requests recorded but excluded
+    "lanes":   {"deeprag": {...}, "sharegpt": {...}},      # per lane (mix / phases)
+    "phases":  {"warm": {...}, "revisit": {...}},          # per phase, same shape as the top level (#5)
     "groups":  {"cache_class": {"device_hit": {...}, "restore": {...}, "miss": {...}}},  # group_by (#2)
     "void":    {"void": false, "violations": [], "checks": [...]},  # void rules (#4)
     "capability": {"start": {...}, "end": {...}},         # raw snapshots (#4)
@@ -140,16 +143,18 @@ One JSON object per line:
   "error": null,
   "workload": "openai-chat",
   "meta": {"prompt_messages": [...], "max_tokens": 128, "finish_reason": "stop",
-           "cache_class": "device_hit"},
+           "lane": "sharegpt", "phase": "revisit", "cache_class": "device_hit"},
   "extra": {"ttft_s": 0.17, "ttft_token_index": 1.0, "itl_ms_mean": 25.3, "tokens_out": 64.0,
-            "tokens_per_s": 32.1, "cached_tokens": 128.0},
+            "tokens_per_s": 32.1, "cached_tokens": 128.0, "prompt_tokens_hint": 1024.0},
   "series": {"itl_ms": [25.1, 25.0, 24.9, 180.2, ...]}
 }
 ```
 
-`meta.cache_class` comes from the OpenAI workload-type's classifier and
-`extra.ttft_token_index` is the chunk the TTFT was stamped on. `series` is
-only written with `dump_series: true`.
+`meta.lane` / `meta.phase` come from `mix` / `phases`, `meta.cache_class`
+from the OpenAI workload-type's classifier, `meta.warmup: true` marks
+warm-up samples (absent otherwise), and any workload item's own `meta` dict
+(capacity tags, dataset columns) is merged in; numeric workload metrics in it
+are promoted to `extra`. `series` is only written with `dump_series: true`.
 
 ### `monitors.jsonl`
 

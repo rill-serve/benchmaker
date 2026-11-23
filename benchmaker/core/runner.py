@@ -19,7 +19,7 @@ from benchmaker.core.capability import (
     fetch_json,
 )
 from benchmaker.core.load import LoadModel
-from benchmaker.core.metrics import DEFAULT_STALL_MS, ITL_SERIES, MetricsAggregator  # noqa: F401 (re-exported)
+from benchmaker.core.metrics import DEFAULT_STALL_MS, ITL_SERIES, WARMUP_META_KEY, MetricsAggregator  # noqa: F401 (re-exported)
 from benchmaker.core.types import (
     PostResponseHook,
     PreRequestHook,
@@ -48,10 +48,44 @@ class BenchLane:
     name: str
     workload: Workload
     load: LoadModel
+    # Route this lane's requests at a different model behind the same endpoint
+    # (multi-model phase, issue #5). ``None`` keeps whatever the workload-type
+    # put in the request.
+    model: Optional[str] = None
+    # Extra metadata stamped onto every sample of the lane (phase labels, arm
+    # tags, ...).
+    meta: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.name or not self.name.strip():
             raise ValueError("lane name must be a non-empty string")
+
+
+@dataclass
+class BenchPhase:
+    """One timed stage of a phased benchmark (issue #5).
+
+    A phase owns its lanes; phases run back-to-back, each lane's load model
+    starts at the phase's own t=0, and every sample is tagged with
+    ``meta["phase"]``. Per-phase summaries (wall time, throughput, lanes, ITL)
+    land in ``summary["phases"]``.
+    """
+
+    name: str
+    lanes: list[BenchLane]
+    duration_s: float
+    # Wait for the phase's in-flight requests to finish before the next phase
+    # starts (clean per-phase windows). Default False: phases switch
+    # back-to-back, as a continuous moving hotspot does.
+    drain: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.name or not self.name.strip():
+            raise ValueError("phase name must be a non-empty string")
+        if not self.lanes:
+            raise ValueError(f"phase {self.name!r} needs at least one lane")
+        if self.duration_s <= 0:
+            raise ValueError(f"phase {self.name!r} duration_s must be > 0")
 
 
 @dataclass
@@ -80,6 +114,14 @@ class BenchConfig:
     dump_series: bool = False
     # ``Sample.meta`` keys to break the summary down by (e.g. ``["cache_class"]``).
     group_by: list[str] = field(default_factory=list)
+    # --- issue #5: warm-up exclusion and phases ---------------------------
+    # Requests fired in the first ``warmup_s`` seconds, or the first
+    # ``warmup_requests`` requests, are tagged ``meta["warmup"]`` and excluded
+    # from every summary block (still written to samples.jsonl).
+    warmup_requests: int = 0
+    warmup_s: float = 0.0
+    # Timed stages run back-to-back (alternative to ``load``/``lanes``).
+    phases: list[BenchPhase] = field(default_factory=list)
     # --- issue #4: runtime capability capture and void rules -------------
     # ``{"url": ..., "headers": {...}, "timeout_s": 10}``: fetched before and
     # after the run; the snapshots are written to the bundle and feed void rules.
@@ -93,7 +135,17 @@ class BenchConfig:
     record_env: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        if self.lanes:
+        if self.phases:
+            if self.load is not None or self.lanes:
+                raise ValueError("configure phases, or load/workload, or lanes — not both")
+            names = [phase.name for phase in self.phases]
+            if len(names) != len(set(names)):
+                raise ValueError("phase names must be unique")
+            for phase in self.phases:
+                lane_names = [lane.name for lane in phase.lanes]
+                if len(lane_names) != len(set(lane_names)):
+                    raise ValueError(f"lane names in phase {phase.name!r} must be unique")
+        elif self.lanes:
             if self.load is not None:
                 raise ValueError("configure either load/workload or lanes, not both")
             names = [lane.name for lane in self.lanes]
@@ -119,6 +171,7 @@ class BenchRunner:
             group_by=list(config.group_by),
             dump_series=config.dump_series,
         )
+        self._fired = 0
         self.capability: Optional[dict[str, Any]] = None
 
     async def run(self) -> BenchResult:
@@ -177,6 +230,13 @@ class BenchRunner:
         if not snapshot.get("ok"):
             logger.warning("capability snapshot (%s) failed: %s", at, snapshot.get("error"))
 
+    def _is_warmup(self, start_mono: float) -> bool:
+        if self.cfg.warmup_requests and self._fired < self.cfg.warmup_requests:
+            return True
+        if self.cfg.warmup_s and start_mono - self.metrics.start_time < self.cfg.warmup_s:
+            return True
+        return False
+
     async def _drive(self, session: httpx2.AsyncClient) -> None:
         sem = asyncio.Semaphore(self.cfg.max_in_flight)
         tasks: set[asyncio.Task] = set()
@@ -193,8 +253,11 @@ class BenchRunner:
             ))
 
         try:
-            if self.cfg.lanes:
-                await self._drive_lanes(session, sem, tasks)
+            if self.cfg.phases:
+                for phase in self.cfg.phases:
+                    await self._drive_phase(session, sem, tasks, phase)
+            elif self.cfg.lanes:
+                await self._drive_lanes(session, sem, tasks, self.cfg.lanes)
             else:
                 await self._drive_single(session, sem, tasks)
         finally:
@@ -231,9 +294,33 @@ class BenchRunner:
             tasks.add(task)
             task.add_done_callback(tasks.discard)
 
+    async def _drive_phase(self, session: httpx2.AsyncClient,
+                           sem: asyncio.Semaphore,
+                           tasks: set[asyncio.Task],
+                           phase: BenchPhase) -> None:
+        """Run one phase's lanes for ``phase.duration_s``, then drain (issue #5).
+
+        Samples are tagged ``meta["phase"]`` so every per-phase summary is
+        complete regardless of timing. With ``drain=True`` the window also
+        covers the in-flight tail, so per-phase throughput is comparable to a
+        standalone run of the same lanes for the same duration.
+        """
+        phase_start = time.monotonic()
+        logger.info("phase %s: %s lanes for %.1fs", phase.name,
+                    ",".join(lane.name for lane in phase.lanes), phase.duration_s)
+        await self._drive_lanes(session, sem, tasks, phase.lanes, phase.name)
+        if phase.drain and tasks:
+            logger.info("phase %s: draining %d in-flight requests", phase.name, len(tasks))
+            await asyncio.gather(*list(tasks), return_exceptions=True)
+        phase_end = time.monotonic()
+        self.metrics.phase_windows[phase.name] = (phase_start, phase_end)
+        logger.info("phase %s: done after %.1fs (drained)", phase.name, phase_end - phase_start)
+
     async def _drive_lanes(self, session: httpx2.AsyncClient,
                            sem: asyncio.Semaphore,
-                           tasks: set[asyncio.Task]) -> None:
+                           tasks: set[asyncio.Task],
+                           lanes: list[BenchLane],
+                           phase_name: Optional[str] = None) -> None:
         """Run each lane's admission iterator concurrently.
 
         A finite workload ends only its own lane.  Other lanes keep producing
@@ -252,12 +339,13 @@ class BenchRunner:
 
                 await sem.acquire()
                 task = asyncio.create_task(
-                    self._fire(session, item, sem, lane.load, lane.name)
+                    self._fire(session, item, sem, lane.load, lane.name,
+                               phase=phase_name, model=lane.model, lane_meta=lane.meta)
                 )
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
 
-        producers = [asyncio.create_task(produce(lane)) for lane in self.cfg.lanes]
+        producers = [asyncio.create_task(produce(lane)) for lane in lanes]
         try:
             await asyncio.gather(*producers)
         finally:
@@ -268,8 +356,17 @@ class BenchRunner:
 
     async def _fire(self, session: httpx2.AsyncClient, item: Any,
                     sem: asyncio.Semaphore, load: LoadModel,
-                    lane_name: Optional[str] = None) -> None:
+                    lane_name: Optional[str] = None,
+                    phase: Optional[str] = None,
+                    model: Optional[str] = None,
+                    overrides: Optional[dict[str, Any]] = None,
+                    lane_meta: Optional[dict[str, Any]] = None) -> None:
         start_mono = time.monotonic()
+        warmup = self._is_warmup(start_mono)
+        self._fired += 1
+        lane_meta = dict(lane_meta or {})
+        if model:
+            overrides = {"model": model, **(overrides or {})}
         try:
             async def fire(req: Request) -> Response:
                 if lane_name is not None:
@@ -277,6 +374,12 @@ class BenchRunner:
                     # still attach arbitrary metadata, but cannot accidentally
                     # collapse a mixed run into an incorrect lane.
                     req.meta["lane"] = lane_name
+                if phase is not None:
+                    req.meta["phase"] = phase
+                if warmup:
+                    req.meta[WARMUP_META_KEY] = True
+                for k, v in lane_meta.items():
+                    req.meta.setdefault(k, v)
                 for hook in self.cfg.pre_hooks:
                     req = await maybe_await(hook(req))
                 fire_start = time.monotonic()
@@ -291,27 +394,39 @@ class BenchRunner:
                 pre_hooks=tuple(self.cfg.pre_hooks),
                 post_hooks=tuple(self.cfg.post_hooks),
                 workload_name=self.cfg.workload_type.name,
+                overrides=dict(overrides or {}),
             )
             sample = await self.cfg.workload_type.run_ticket(ctx)
             if lane_name is not None:
                 sample.meta["lane"] = lane_name
+            if phase is not None:
+                sample.meta["phase"] = phase
+            if warmup or (sample.meta.get(WARMUP_META_KEY)):
+                sample.meta[WARMUP_META_KEY] = True
+            for k, v in lane_meta.items():
+                sample.meta.setdefault(k, v)
             self.metrics.add(sample)
         except Exception as e:
+            fail_meta = {k: v for k, v in (("phase", phase), (WARMUP_META_KEY, True if warmup else None)) if v is not None}
             self.metrics.add(_failure_sample(
                 f"{type(e).__name__}: {e}",
                 self.cfg.workload_type.name,
                 lane_name,
+                meta=fail_meta,
             ))
         finally:
             sem.release()
             load.on_complete()
 
     async def _aclose_workloads(self) -> None:
-        workloads = (
-            [lane.workload for lane in self.cfg.lanes]
-            if self.cfg.lanes
-            else [self.cfg.workload]
-        )
+        workloads: list[Workload] = []
+        if self.cfg.phases:
+            for phase in self.cfg.phases:
+                workloads.extend(lane.workload for lane in phase.lanes)
+        elif self.cfg.lanes:
+            workloads.extend(lane.workload for lane in self.cfg.lanes)
+        else:
+            workloads.append(self.cfg.workload)
         closed: set[int] = set()
         for workload in workloads:
             if id(workload) not in closed:
@@ -440,7 +555,10 @@ class BenchRunner:
 
         workload_name = (
             "mix:" + ",".join(lane.name for lane in self.cfg.lanes)
-            if self.cfg.lanes else self.cfg.workload.name
+            if self.cfg.lanes
+            else "phases:" + ",".join(p.name for p in self.cfg.phases)
+            if self.cfg.phases
+            else self.cfg.workload.name
         )
         if manifest is None:
             manifest = build_manifest(
@@ -472,7 +590,11 @@ class BenchRunner:
 
 
 def _failure_sample(error: str, workload: str,
-                    lane_name: Optional[str] = None) -> Sample:
+                    lane_name: Optional[str] = None,
+                    meta: Optional[dict[str, Any]] = None) -> Sample:
+    m = dict(meta or {})
+    if lane_name is not None:
+        m["lane"] = lane_name
     return Sample(
         start_ts=time.monotonic(),
         latency_s=0.0,
@@ -481,7 +603,7 @@ def _failure_sample(error: str, workload: str,
         request_ok=False,
         error=error,
         workload=workload,
-        meta={"lane": lane_name} if lane_name is not None else {},
+        meta=m,
     )
 
 
