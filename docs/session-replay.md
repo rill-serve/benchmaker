@@ -60,4 +60,6 @@ load: closed:8
 ```
 
 The workload's completion hook (which releases each session's next turn) is installed automatically. Rows with
-`prompt_ids` instead of `messages` need a completions workload type and are refused.
+`prompt_ids` instead of `messages` are refused here: send them with
+`workload_type: {type: openai-completions, ...}` (see
+[trace replay](trace-replay.md#send-token_ids-bypass-the-tokenizer-11)).

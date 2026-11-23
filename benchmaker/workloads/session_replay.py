@@ -100,7 +100,8 @@ def think_seconds(row: dict, median_s: float, sigma: float) -> float:
 def to_item(row: dict) -> dict:
     """The chat item for one row: recorded history, pinned output length, replay identifiers in meta."""
     if "messages" not in row:
-        raise ValueError(f"row {row.get('id')!r} has no messages (token-id rows need a completions workload type)")
+        raise ValueError(f"row {row.get('id')!r} has no messages (token-id rows need "
+                                 f"workload_type: {{type: openai-completions}}, #11)")
     meta = {
         "conversation_id": row["session"],
         "turn_index": row.get("turn"),
