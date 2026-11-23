@@ -11,6 +11,10 @@ Each benchmark run writes a directory:
         monitors.jsonl         # one record per monitor tick
         capability.start.json  # server self-description before the run (#4, optional)
         capability.end.json    # ... and after it (optional)
+        capability.<model>.start.json / .end.json
+                               # per-endpoint snapshots when an arm fans out to
+                               # several servers (#8, optional)
+        meta.json#hooks        # start/stop hook exit codes and log paths (#9, optional)
 
 The bundle is the unit of result interchange. `benchmaker collect` walks
 one or more such directories and pivots the summaries into a table.
@@ -38,6 +42,17 @@ SAMPLES_FILENAME = "samples.jsonl"
 MONITORS_FILENAME = "monitors.jsonl"
 CAPABILITY_START_FILENAME = "capability.start.json"
 CAPABILITY_END_FILENAME = "capability.end.json"
+_CAPABILITY_PREFIX = "capability."
+
+
+def _safe_segment(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_.," else "_" for c in name) or "endpoint"
+
+
+def capability_filenames(name: str) -> tuple[str, str]:
+    """``(start, end)`` file names for endpoint ``name`` (#8)."""
+    safe = _safe_segment(name)
+    return f"{_CAPABILITY_PREFIX}{safe}.start.json", f"{_CAPABILITY_PREFIX}{safe}.end.json"
 
 
 def default_run_id(prefix: Optional[str] = None) -> str:
@@ -66,9 +81,12 @@ class RunMeta:
     # Void verdict (issue #4): None when no void rules were configured.
     void: Optional[bool] = None
     void_violations: list = field(default_factory=list)
+    # Arm lifecycle hooks that ran around this rep (issue #9): exit codes,
+    # durations, log paths and readiness/teardown check results.
+    hooks: Optional[dict] = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "run_id": self.run_id,
             "bundle_version": self.bundle_version,
             "bench_maker_version": self.bench_maker_version,
@@ -85,6 +103,9 @@ class RunMeta:
             "void_violations": self.void_violations,
             "source_config": _safe_meta(self.source_config),
         }
+        if self.hooks is not None:
+            d["hooks"] = _safe_meta(self.hooks)
+        return d
 
 
 def write_bundle(
@@ -102,6 +123,7 @@ def write_bundle(
     manifest: Optional[dict] = None,
     capability: Optional[dict[str, Any]] = None,
     summary: Optional[dict] = None,
+    hooks: Optional[dict[str, Any]] = None,
 ) -> str:
     """Write the bundle for a finished run. Returns the absolute run directory path.
 
@@ -113,9 +135,11 @@ def write_bundle(
     pass `run_id=""` to skip the extra nesting.
 
     ``manifest`` (see :mod:`benchmaker.io.manifest`) and ``capability``
-    (``{"start": ..., "end": ...}`` snapshots) are written as separate files
-    when given (#4). The void verdict, if any, is copied into ``meta.json`` so
-    `collect` can flag void runs without opening summary.json.
+    (``{"start": ..., "end": ...}`` snapshots, or ``{"endpoints": {model:
+    {"start", "end"}}}`` with an endpoint map, #8) are written as separate
+    files when given (#4). The void verdict, if any, is copied into
+    ``meta.json`` so `collect` can flag void runs without opening
+    summary.json. ``hooks`` (#9) lands in ``meta.json`` as ``hooks``.
     """
     from benchmaker import __version__ as bm_version
 
@@ -146,6 +170,7 @@ def write_bundle(
         notes=notes,
         void=bool(void["void"]) if void else None,
         void_violations=list(void.get("violations", [])) if void else [],
+        hooks=hooks,
     )
 
     with open(os.path.join(target, META_FILENAME), "w") as f:
@@ -167,12 +192,56 @@ def write_bundle(
         if snap is not None:
             with open(os.path.join(target, name), "w") as f:
                 json.dump(snap, f, indent=2, default=_json_default)
+    for ep_name, snaps in ((capability or {}).get("endpoints") or {}).items():
+        start_name, end_name = capability_filenames(ep_name)
+        for at, name in (("start", start_name), ("end", end_name)):
+            snap = (snaps or {}).get(at)
+            if snap is not None:
+                with open(os.path.join(target, name), "w") as f:
+                    json.dump(snap, f, indent=2, default=_json_default)
 
     metrics.dump_samples_jsonl(os.path.join(target, SAMPLES_FILENAME))
     if metrics.monitor_samples:
         metrics.dump_monitor_jsonl(os.path.join(target, MONITORS_FILENAME))
 
     return os.path.abspath(target)
+
+
+def patch_bundle(run_dir: str, *, hooks: Optional[dict[str, Any]] = None,
+                 void_violations: Optional[list] = None) -> None:
+    """Amend a written bundle in place (issue #9).
+
+    ``hooks`` is merged into ``meta.hooks`` (key-wise, so a rep's ``stop``
+    record joins its ``start`` record). ``void_violations`` are appended to
+    both ``summary.void`` and ``meta.void/void_violations`` — that is how a
+    failed readiness or teardown check makes a rep void after the fact, since
+    `collect`/`compare` read the verdict from ``meta.json``.
+    """
+    from benchmaker.core.capability import merge_void_verdicts
+
+    meta_path = os.path.join(run_dir, META_FILENAME)
+    summary_path = os.path.join(run_dir, SUMMARY_FILENAME)
+    with open(meta_path) as f:
+        meta = json.load(f)
+    with open(summary_path) as f:
+        summary = json.load(f)
+    if hooks:
+        merged = dict(meta.get("hooks") or {})
+        for k, v in hooks.items():
+            if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                merged[k] = {**merged[k], **v}
+            else:
+                merged[k] = v
+        meta["hooks"] = merged
+    if void_violations:
+        prev = summary.get("void") or {"void": False, "violations": [], "checks": []}
+        summary["void"] = merge_void_verdicts([prev, {"void": True, "violations": list(void_violations), "checks": []}])
+        meta["void"] = bool(summary["void"]["void"])
+        meta["void_violations"] = list(summary["void"]["violations"])
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2, default=_json_default)
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2, default=_json_default)
 
 
 def read_bundle(run_dir: str) -> dict:
@@ -195,14 +264,29 @@ def read_bundle(run_dir: str) -> dict:
         summary = json.load(f)
     samples = os.path.join(run_dir, SAMPLES_FILENAME)
     monitors = os.path.join(run_dir, MONITORS_FILENAME)
+    capability = {
+        at: _read_json_if_exists(os.path.join(run_dir, name))
+        for at, name in (("start", CAPABILITY_START_FILENAME), ("end", CAPABILITY_END_FILENAME))
+    }
+    # Per-endpoint snapshots (#8): capability.<model>.{start,end}.json.
+    per: dict[str, dict] = {}
+    if os.path.isdir(run_dir):
+        for fn in sorted(os.listdir(run_dir)):
+            if not fn.startswith(_CAPABILITY_PREFIX) or not fn.endswith(".json"):
+                continue
+            stem = fn[len(_CAPABILITY_PREFIX):-len(".json")]
+            ep_name, _, at = stem.rpartition(".")
+            if at not in ("start", "end") or not ep_name:
+                continue
+            per.setdefault(ep_name, {"start": None, "end": None})[at] = _read_json_if_exists(
+                os.path.join(run_dir, fn))
+    if per:
+        capability["endpoints"] = per
     return {
         "meta": meta,
         "summary": summary,
         "manifest": _read_json_if_exists(os.path.join(run_dir, MANIFEST_FILENAME)),
-        "capability": {
-            at: _read_json_if_exists(os.path.join(run_dir, name))
-            for at, name in (("start", CAPABILITY_START_FILENAME), ("end", CAPABILITY_END_FILENAME))
-        },
+        "capability": capability,
         "samples_path": samples if os.path.isfile(samples) else None,
         "monitors_path": monitors if os.path.isfile(monitors) else None,
         "dir": os.path.abspath(run_dir),

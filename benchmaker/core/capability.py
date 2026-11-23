@@ -182,11 +182,14 @@ def _apply_op(op: str, actual: Any, expected: Any) -> tuple[bool, Optional[str]]
     return False, f"unknown op {op}"
 
 
-def _violation(rule: VoidRule, actual: Any, reason: str) -> dict:
-    return {
+def _violation(rule: VoidRule, actual: Any, reason: str, endpoint: Optional[str] = None) -> dict:
+    v = {
         "rule": rule.name, "at": rule.at, "path": rule.path, "op": rule.op,
         "expected": rule.value, "actual": actual, "reason": reason,
     }
+    if endpoint is not None:
+        v["endpoint"] = endpoint
+    return v
 
 
 @dataclass
@@ -204,8 +207,10 @@ class VoidVerdict:
 
 
 def evaluate_void_rules(rules: list[VoidRule], start: Optional[dict],
-                        end: Optional[dict]) -> VoidVerdict:
-    """Evaluate every rule at its declared snapshot(s)."""
+                        end: Optional[dict], *, endpoint: Optional[str] = None) -> VoidVerdict:
+    """Evaluate every rule at its declared snapshot(s). With an ``endpoint``
+    name (issue #8) every check and violation records which endpoint it was
+    read from."""
     verdict = VoidVerdict()
     for rule in rules:
         for at, snap in (("start", start), ("end", end)):
@@ -214,14 +219,39 @@ def evaluate_void_rules(rules: list[VoidRule], start: Optional[dict],
             v = check_rule(rule, snap)
             if v is not None and rule.at == "both":
                 v["at"] = at  # which of the two snapshots violated
-            verdict.checks.append({
+            check = {
                 "rule": rule.name, "at": at, "path": rule.path, "op": rule.op,
                 "expected": rule.value, "ok": v is None,
-            })
+            }
+            if endpoint is not None:
+                check["endpoint"] = endpoint
+                if v is not None:
+                    v.setdefault("endpoint", endpoint)
+            verdict.checks.append(check)
             if v is not None:
                 verdict.violations.append(v)
     verdict.void = bool(verdict.violations)
     return verdict
+
+
+def merge_void_verdicts(verdicts: list[dict]) -> dict:
+    """Combine per-endpoint (or hook-added) ``{"void", "violations", "checks"}``
+    blocks into one: void if any is, checks and violations concatenated."""
+    out = {"void": False, "violations": [], "checks": []}
+    for v in verdicts:
+        if not v:
+            continue
+        out["void"] = out["void"] or bool(v.get("void"))
+        out["violations"].extend(v.get("violations") or [])
+        out["checks"].extend(v.get("checks") or [])
+    return out
+
+
+def hook_violation(rule: str, reason: str, **extra: Any) -> dict:
+    """A violation that does not come from a void rule but from the run's
+    lifecycle (a failed readiness or teardown check, issue #9)."""
+    return {"rule": rule, "at": "hooks", "path": None, "op": None, "expected": None,
+            "actual": None, "reason": reason, **extra}
 
 
 # --------------------------------------------------------------------------- #

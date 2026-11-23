@@ -50,6 +50,26 @@ normalized to `{"models": ["id", ...], "models_detail": [...]}` so rules can
 say `models contains "qwen2.5-32b"`. Everything else (vLLM/SGLang
 `get_server_info`, `get_model_info`, a custom endpoint) is kept as-is.
 
+### Several endpoints (issue #8)
+
+With `endpoints:` — one server per `model`, see
+[Multi-arm comparisons](arms.md#several-servers-per-arm-issue-8) — the
+snapshot is taken from **every** endpoint (each entry may carry its own
+`capability:` URL, default `/v1/models` on the endpoint's base URL) and
+stored as a pair per endpoint:
+
+```
+capability.<model>.start.json
+capability.<model>.end.json      # model name with / : . @ replaced by _
+```
+
+`read_bundle()["capability"]` then has `{"start": null, "end": null,
+"endpoints": {"<model>": {"start": {...}, "end": {...}}}}` (the plain keys
+stay for single-endpoint runs), `void_rules` are evaluated against every
+endpoint's snapshots (a violation names the endpoint in its `path`:
+`endpoints.<model>.models.0`), and `manifest.endpoints.<model>` records that
+server's URL and the model id / revision it reported.
+
 ## Void rules
 
 ```yaml
@@ -121,7 +141,10 @@ From Python: `benchmaker.core.capability.parse_void_rules`,
   "run_id": "rep-1",
   "started_at": "2026-07-01T12:00:03+00:00",
   "config_hash": "sha256:…",             // canonical JSON of the *resolved* config, not the YAML text
-  "prompt_set": {"name": "jsonl:sharegpt_v3.jsonl", "hash": "sha256:…", "items": 400},
+  "prompt_set": {"name": "jsonl:sharegpt_v3.jsonl", "hash": "sha256:…", "items": 400,
+                 "provenance": {"source": "mooncake", "records": 20000, "send": "token_ids", "namespace": "m",
+                                "token_whitelist": {"size": 151808, "source": "tokenizer:Qwen/Qwen2.5-7B"},
+                                "max_seq": 32768, "dropped": {"max_seq": 12}}},
   "model": {
     "id": "qwen2.5-32b",                 // workload_type.model, or the server's
     "revision": "3b1f…",                 // from config (model_revision) or the capability snapshot
@@ -131,9 +154,19 @@ From Python: `benchmaker.core.capability.parse_void_rules`,
   "host": {"hostname": "gpu-07", "platform": "…", "python": "3.12.2", "pid": 4242, "cpu_count": 128,
            "job_id": "123456", "source": "SLURM_JOB_ID"},
   "env": {"CUDA_VISIBLE_DEVICES": "0,1,2,3", "VLLM_USE_V1": "1", "RILL_KV_CACHE_TIER": "host"},
-  "labels": {"arm": "rill", "rep": 1, "gpus": "8xh100"}
+  "labels": {"arm": "rill", "rep": 1, "gpus": "8xh100"},
+  "endpoints": {"qwen2.5-7b": {"url": "http://rill:8401/v1/chat/completions", "capability_model": "qwen2.5-7b",
+                               "revision": "3b1f…", "revision_source": "capability:model_revision"}}
 }
 ```
+
+`prompt_set.provenance` (when the workload has it — trace replay, capacity,
+…) is the workload's own account of what it rendered: for a trace, the
+source, the record count after subsetting, `send: text|token_ids`, the
+`namespace` / `unique_tail` / `block_size` knobs, the token whitelist and
+how many rows each `max_*` rule dropped. Two bundles with the same
+`prompt_set.hash` have the same prompts; two with the same trace file but
+different `provenance.dropped` do not.
 
 How each field is found:
 
@@ -168,6 +201,9 @@ Pass `record_env: [MY_SERVER_*]` in YAML to record more.
 | `benchmaker collect` / `compare`  | exclude void bundles; show `_VOID` rows                            |
 | `benchmaker arms` same-job check  | `host.job_id` / `host.hostname` must agree across non-warm-up reps |
 | `benchmaker arms` TTFT parity     | `meta.source_config.workload_type.ttft_token`                      |
+| `benchmaker arms` void exclusion  | `meta.void` / `meta.void_violations` — incl. lifecycle checks (#9):   |
+|                                   | `meta.hooks.{start,ready_check,stop,post_stop_check}` records which  |
+|                                   | hooks ran around the rep and whether they passed                    |
 | You, before trusting a table      | same `prompt_set.hash`, same `model.revision`, same `host`         |
 
 A difference in `prompt_set.hash` between two bundles that are supposed to

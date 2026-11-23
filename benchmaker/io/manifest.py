@@ -10,7 +10,9 @@ manifest adds the identity a reader needs before trusting a comparison:
                          for having replayed the same items.
 * ``model``            — served model id and, when known, revision, with the
                          source of the revision (explicit config or the server's
-                         capability snapshot).
+                         capability snapshot). With an endpoint map (#8) the
+                         top-level entry describes the workload-type's model
+                         and ``endpoints`` lists every server's identity.
 * ``host``              — hostname and job id (Slurm/PBS/LSF/K8s), so reps that
                          silently landed on different nodes can be detected.
 * ``env``               — a filtered subset of environment variables (server
@@ -30,6 +32,7 @@ import subprocess
 from typing import Any, Optional
 
 from benchmaker.core.capability import extract_model_identity
+from benchmaker.core.endpoints import route_url
 
 MANIFEST_VERSION = 1
 MANIFEST_FILENAME = "manifest.json"
@@ -121,18 +124,33 @@ def build_manifest(
     env: Optional[dict[str, str]] = None,
     record_env: Optional[list[str]] = None,
     benchmaker_version: str = "",
+    endpoints: Optional[dict] = None,
+    template_url: Optional[str] = None,
 ) -> dict:
-    """Assemble the manifest dict. See module docstring for the fields."""
+    """Assemble the manifest dict. See module docstring for the fields.
+
+    ``endpoints`` (issue #8) is ``BenchConfig.endpoints``: each entry is
+    recorded with its URL (routed through ``template_url``, the
+    workload-type's URL, when it is a base URL) and the model identity from
+    its own snapshots.
+    A workload may expose ``provenance()`` (trace replay does, #11): it is
+    stored under ``prompt_set.provenance`` next to the content hash.
+    """
     import time as _time
 
     wt_model = getattr(workload_type, "model", None)
     cap = capability or {}
+
+    def _identity(snaps: Optional[dict]) -> dict:
+        snaps = snaps or {}
+        return {
+            **extract_model_identity(snaps.get("end")),
+            **{k: v for k, v in extract_model_identity(snaps.get("start")).items() if v is not None},
+        }
+
     # Identity from the start snapshot first, falling back to the end one (a
     # revision the server only reports after warm-up is still an identity).
-    cap_identity = {
-        **extract_model_identity(cap.get("end")),
-        **{k: v for k, v in extract_model_identity(cap.get("start")).items() if v is not None},
-    }
+    cap_identity = _identity(cap)
 
     revision: Optional[str] = None
     revision_source: Optional[str] = None
@@ -154,6 +172,12 @@ def build_manifest(
             prompt_set["items"] = n_items()
         except Exception:
             prompt_set["items"] = None
+    provenance = getattr(workload, "provenance", None)
+    if callable(provenance):
+        try:
+            prompt_set["provenance"] = provenance()
+        except Exception:
+            prompt_set["provenance"] = None
 
     manifest: dict[str, Any] = {
         "manifest_version": MANIFEST_VERSION,
@@ -175,6 +199,21 @@ def build_manifest(
         },
         "labels": dict(labels or {}),
     }
+    if endpoints:
+        per = cap.get("endpoints") or {}
+        manifest["endpoints"] = {}
+        for name, spec in endpoints.items():
+            ident = _identity(per.get(name))
+            raw_url = str(spec.get("url") or "") if isinstance(spec, dict) else str(spec)
+            url = route_url(raw_url, template_url) if template_url else raw_url
+            manifest["endpoints"][name] = {
+                "url": url,
+                "capability_model": ident.get("model"),
+                "revision": ident.get("revision"),
+                "revision_source": ident.get("source"),
+            }
+            if url != raw_url:
+                manifest["endpoints"][name]["configured_url"] = raw_url
     commit = git_commit_of(os.path.dirname(os.path.abspath(__file__)))
     if commit:
         manifest["benchmaker_git_commit"] = commit

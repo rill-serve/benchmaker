@@ -13,6 +13,32 @@
   are excluded from summaries, and `--template-check` refuses a server whose
   prompt-token count for the manifest's probe conversation differs from the
   prepared one.
+- **Several endpoints per run (#8):** `endpoints: {model: url | {url,
+  capability, headers}}` routes each request by its body `model` (a lane's
+  `model:` or a workload item's) to its own server; samples are stamped
+  `meta.model` / `meta.endpoint` and `group_by: [model]` is implied.
+  Capability snapshots (`capability.<model>.{start,end}.json`), `void_rules`
+  and the manifest (`manifest.endpoints`) run per endpoint. Arm-level
+  `endpoints:` in `benchmaker arms` are merged into the arm's config.
+- **Arm lifecycle (#9):** `start` / `stop` hooks (`launch` is an alias for
+  `start`), `relaunch: once | every_rep | visit`, `ready_check` (URL status
+  or shell command, polled with a timeout) and `post_stop_check` (teardown
+  verification). Hooks run with a timeout and are recorded in every bundle
+  of the launch (`meta.hooks`: command, exit code, duration, log tail); a
+  failed readiness check voids the reps that ran under it, a failed
+  teardown check voids the launch's reps after the fact (`patch_bundle`);
+  `stop` always runs — on failure or interrupt too. Fixed `compare` to
+  honour the bool `meta.void` that real bundles write.
+- **Token-id trace replay (#11):** `send: token_ids` on the Mooncake /
+  trace workloads renders every hash block as token ids from a whitelist
+  (from `tokenizer:` or `vocab_size` / `exclude_ids` / `exclude_last`;
+  special and added tokens removed) and sends `prompt: [ids]` through the
+  new `openai-completions` workload-type (`/v1/completions`, SSE
+  `choices[*].text`, `prompt` as string / list / token ids). `namespace:`
+  (or `model`) salts block content per served model; `unique_tail: N` makes
+  whole-prompt duplicates stop being byte-identical; `max_seq:` drops
+  oversized rows and all drop reasons are counted in
+  `manifest.prompt_set.provenance` next to the replay parameters.
 - **Decode stalls and pooled ITL (#1):** every streamed request's raw
   inter-token gaps are pooled across requests into
   `workload_metrics.itl_ms_pooled` (`count/mean/min/max/p50/p90/p99/p995/p999`),

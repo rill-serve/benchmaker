@@ -403,7 +403,7 @@ See [Metrics & output](metrics.md) for the on-disk bundle layout.
 ```yaml
 # ---------- workload-type (required) ----------
 workload_type:
-  type: http | openai | factory      # see below
+  type: http | openai | openai-completions | factory      # see below
   # type-specific kwargs:
   url: ...
   method: GET
@@ -494,6 +494,14 @@ group_by: [cache_class, visit]       # break the summary (and every lane/phase) 
 stall_ms: 12                         # inter-token gap above this is a decode stall ("none" disables)
 dump_series: false                   # write every sample's raw per-token series into samples.jsonl
 
+# ---------- several endpoints, one per model (optional; docs/arms.md#several-servers-per-arm-issue-8) ----------
+# A request's body `model` (lane `model:` or an item's `model`) selects the URL it is sent to.
+# Sample meta gets `model`/`endpoint`; `group_by: [model]` is implied. Capability / void rules /
+# manifest run per endpoint.
+endpoints:
+  qwen2.5-7b: http://a:8000/v1/chat/completions                      # string = URL (path of workload_type.url kept for a base URL)
+  qwen2.5-32b: {url: "http://b:8000/v1/chat/completions", capability: "http://b:8000/server_info", headers: {X-Tier: large}}
+
 # ---------- capability & void rules (optional; docs/capability-manifest.md) ----------
 capability:
   url: http://localhost:8000/v1/models   # fetched before and after the run
@@ -516,7 +524,14 @@ progress_every_s: 1.0                # 0 disables progress output
 
 - `http` — kwargs map to `HttpWorkloadType(...)`.
 - `openai` (or `llm`, `llm-chat`, `openai-chat`) — kwargs map to
-  `OpenAIChatWorkloadType(...)`.
+  `OpenAIChatWorkloadType(...)` (`/v1/chat/completions`).
+- `openai-completions` (or `completions`, `openai-text`, `text-completions`) —
+  kwargs map to
+  `OpenAICompletionsWorkloadType(...)`: `/v1/completions`, whose `prompt`
+  may be a string, a list of strings, or a **list of token ids** (the
+  workload-type accepts all three; `meta.prompt_kind` says which). Pair with
+  a trace workload in `send: token_ids` mode — see
+  [trace replay](trace-replay.md#send-token_ids-bypass-the-tokenizer-11).
 - `sglang-generate` (or `sglang`) — kwargs map to
   `SGLangGenerateWorkloadType(...)`.
 - `sandbox` (or `flash-sandbox`) — kwargs map to `SandboxWorkloadType(...)`.

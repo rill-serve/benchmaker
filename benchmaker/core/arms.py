@@ -1,5 +1,6 @@
 """Multi-arm comparison runs: ABBA interleaving, per-rep bundles, same-job
-enforcement (issue #3).
+enforcement (issue #3), per-model endpoint maps (#8) and start/stop lifecycle
+hooks with readiness and teardown checks (#9).
 
 A *multi-arm run* executes the same benchmark config against several servers
 ("arms") several times each ("reps"), interleaved so that node drift affects
@@ -13,13 +14,19 @@ every arm equally. The YAML shape::
       reference: rill        # ratios are against this arm (default: first)
       allow_mixed_jobs: false
       metrics: [ttft_p99, itl_p99.5, ...]
-      launch_timeout_s: 600
+      launch_timeout_s: 600  # start hook timeout
+      ready_timeout_s: 600   # ready_check polling budget
+      stop_timeout_s: 120    # stop hook timeout
       arms:
         rill:
           config: {workload_type: {url: "http://rill:8000/v1/chat/completions"}}
           env: {RILL_KV_CACHE_TIER: host}
-          launch: "./scripts/launch-rill.sh"   # run before the arm's first rep
-          relaunch: once                       # once | every_rep
+          start: "./scripts/start-rill.sh"    # run before the arm's first rep ("launch" is an alias)
+          stop: "./scripts/stop-rill.sh"      # run after the arm's last rep, also on failure/interrupt
+          ready_check: {urls: ["http://rill:8000/health"], status: 200, timeout_s: 300}
+          post_stop_check: {run: "! nvidia-smi --query-compute-apps=pid --format=csv,noheader | grep -q ."}
+          relaunch: visit                   # once | every_rep | visit
+          endpoints: {model_a: "http://rill:8401", model_b: "http://rill:8402"}   # #8
           labels: {image: "rill:0.9.1"}
         vllm:
           config: {workload_type: {url: "http://vllm:8000/v1/chat/completions"}}
@@ -31,9 +38,20 @@ every arm equally. The YAML shape::
 
 Each ``(arm, rep)`` writes its own bundle under
 ``<out-dir>/<run-id>/arms/<arm>/rep-<k>/`` with its own manifest (host/job id,
-capability snapshots, void verdict); the comparison table, TTFT parity check
-and TTFT mix/latency decomposition go next to them in ``comparison.json`` /
+capability snapshots, void verdict) and the hook records that surrounded it
+(``meta.hooks``, #9); the comparison table, TTFT parity check and TTFT
+mix/latency decomposition go next to them in ``comparison.json`` /
 ``comparison.md``.
+
+Lifecycle (issue #9): ``relaunch`` decides when a launch starts and stops —
+``once`` starts before the arm's first rep and stops after its last (or at
+the end of the run); ``every_rep`` wraps every rep; ``visit`` wraps every
+*contiguous run* of the arm's reps in the plan, so in ABBA order the GPUs are
+free again before the other arm starts. ``stop`` is always run for a started
+launch — on failure or interrupt too — with ``stop_timeout_s``. A failed
+``ready_check`` voids the reps that ran under that launch; a failed
+``post_stop_check`` voids the launch's reps as well; both are recorded as
+void reasons in the bundles and the comparison.
 """
 
 from __future__ import annotations
@@ -42,11 +60,15 @@ import copy
 import logging
 import os
 import random
+import signal
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from benchmaker.core.capability import hook_violation
 from benchmaker.core.compare import (
     DEFAULT_METRICS,
     RunRef,
@@ -58,10 +80,14 @@ from benchmaker.core.compare import (
     ttft_parity,
     ttft_parity_warnings,
 )
+from benchmaker.core.endpoints import normalize_endpoints
 
 _logger = logging.getLogger(__name__)
 
 ORDERS = ("abba", "rep-major", "random")
+RELAUNCH_MODES = ("once", "every_rep", "visit")
+DEFAULT_INTERVAL_S = 2.0
+OUTPUT_TAIL_CHARS = 2048
 
 
 @dataclass
@@ -69,8 +95,20 @@ class ArmSpec:
     name: str
     config: dict = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
-    launch: Optional[str] = None
+    # ``start`` (alias ``launch``): shell command run before the arm's first
+    # rep under the current launch; a non-zero exit aborts the run (#9).
+    start: Optional[str] = None
+    # ``stop``: shell command run after the launch's last rep, and on failure
+    # or interrupt — so the GPUs are free before the next arm starts (#9).
+    stop: Optional[str] = None
     relaunch: str = "once"
+    # ``ready_check``: ``{urls: [...], status: 200, run: "...", timeout_s, interval_s}``
+    # polled after the start hook returns; a failure voids the launch's reps.
+    ready_check: dict = field(default_factory=dict)
+    # ``post_stop_check``: same shape, run once after the stop hook.
+    post_stop_check: dict = field(default_factory=dict)
+    # ``endpoints``: per-model server map (#8), merged into the arm's config.
+    endpoints: dict = field(default_factory=dict)
     labels: dict = field(default_factory=dict)
 
     @classmethod
@@ -78,11 +116,18 @@ class ArmSpec:
         if not isinstance(d, dict):
             raise TypeError(f"arms.{name} must be a mapping")
         env = {str(k): str(v) for k, v in (d.get("env") or {}).items()}
-        relaunch = str(d.get("relaunch", "once") or "once").lower()
-        if relaunch not in ("once", "every_rep", "every-rep"):
-            raise ValueError(f"arms.{name}.relaunch must be once or every_rep, got {relaunch!r}")
+        relaunch = str(d.get("relaunch", "once") or "once").lower().replace("-", "_")
+        if relaunch not in RELAUNCH_MODES:
+            raise ValueError(f"arms.{name}.relaunch must be one of {RELAUNCH_MODES}, got {relaunch!r}")
+        start = d.get("start") or d.get("launch")
+        for key in ("ready_check", "post_stop_check"):
+            if d.get(key) is not None and not isinstance(d[key], dict):
+                raise TypeError(f"arms.{name}.{key} must be a mapping")
         return cls(name=name, config=dict(d.get("config") or {}), env=env,
-                   launch=d.get("launch"), relaunch=relaunch,
+                   start=start, stop=d.get("stop"), relaunch=relaunch,
+                   ready_check=dict(d.get("ready_check") or {}),
+                   post_stop_check=dict(d.get("post_stop_check") or {}),
+                   endpoints=normalize_endpoints(d.get("endpoints")),
                    labels=dict(d.get("labels") or {}))
 
 
@@ -96,6 +141,9 @@ class ArmsSettings:
     allow_mixed_jobs: bool = False
     metrics: list[str] = field(default_factory=lambda: list(DEFAULT_METRICS))
     launch_timeout_s: float = 600.0
+    ready_timeout_s: float = 600.0
+    stop_timeout_s: float = 120.0
+    check_timeout_s: float = 60.0
     arms: list[ArmSpec] = field(default_factory=list)
 
 
@@ -116,7 +164,7 @@ def parse_arms_config(cfg: dict) -> tuple[dict, ArmsSettings]:
         raise ValueError("multi-arm config needs an 'arms:' block with named arms")
     arms_spec = spec["arms"]
     if not isinstance(arms_spec, dict) or not arms_spec:
-        raise ValueError("'arms.arms' must map arm name -> {config, env, launch, ...}")
+        raise ValueError("'arms.arms' must map arm name -> {config, env, start, stop, ...}")
     settings = ArmsSettings(
         reps=int(spec.get("reps", 1)),
         order=str(spec.get("order", "abba")).lower(),
@@ -126,6 +174,9 @@ def parse_arms_config(cfg: dict) -> tuple[dict, ArmsSettings]:
         allow_mixed_jobs=bool(spec.get("allow_mixed_jobs", False)),
         metrics=[str(m) for m in (spec.get("metrics") or DEFAULT_METRICS)],
         launch_timeout_s=float(spec.get("launch_timeout_s", 600)),
+        ready_timeout_s=float(spec.get("ready_timeout_s", 600)),
+        stop_timeout_s=float(spec.get("stop_timeout_s", 120)),
+        check_timeout_s=float(spec.get("check_timeout_s", 60)),
         arms=[ArmSpec.from_dict(name, d) for name, d in arms_spec.items()],
     )
     if settings.reps < 1:
@@ -174,6 +225,175 @@ def plan_order(arm_names: list[str], reps: int, order: str = "abba",
 
 
 # --------------------------------------------------------------------------- #
+# Hooks and checks (issue #9)                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """SIGTERM then SIGKILL the hook's whole process group (it got its own
+    session), so a hung launcher cannot leave the run waiting."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except Exception:  # noqa: BLE001 - already gone
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except Exception:  # noqa: BLE001
+            break
+        try:
+            proc.wait(timeout=10)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _tail(path: str, limit: int = OUTPUT_TAIL_CHARS) -> str:
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - limit))
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def run_hook(command: str, *, arm: str, rep: Optional[int], env: dict[str, str],
+             log_path: str, timeout_s: float) -> dict:
+    """Run a shell hook synchronously and return its record (issue #9):
+    ``{command, exit_code, timed_out, error, duration_s, log, output_tail}``.
+    Never raises for a failing hook — the caller decides what a non-zero exit
+    means. ``BENCHMAKER_ARM`` / ``BENCHMAKER_REP`` are exported to the hook
+    along with the arm's ``env``."""
+    full_env = {**os.environ, **env, "BENCHMAKER_ARM": arm}
+    if rep is not None:
+        full_env["BENCHMAKER_REP"] = str(rep)
+    rec: dict[str, Any] = {"command": command, "exit_code": None, "timed_out": False,
+                           "error": None, "duration_s": None, "log": log_path}
+    t0 = time.monotonic()
+    try:
+        with open(log_path, "w") as log:
+            proc = subprocess.Popen(  # noqa: S602 - user-provided lab script
+                command, shell=True, env=full_env, stdout=log,
+                stderr=subprocess.STDOUT, cwd=os.getcwd(), start_new_session=True)
+            try:
+                proc.wait(timeout=timeout_s)
+                rec["exit_code"] = proc.returncode
+            except subprocess.TimeoutExpired:
+                rec["timed_out"] = True
+                rec["error"] = f"timed out after {timeout_s:.0f}s"
+                _kill_tree(proc)
+            except BaseException:
+                _kill_tree(proc)
+                raise
+    except OSError as e:
+        rec["error"] = f"{type(e).__name__}: {e}"
+    rec["duration_s"] = time.monotonic() - t0
+    rec["output_tail"] = _tail(log_path)
+    return rec
+
+
+def http_status(url: str, timeout_s: float) -> int:
+    """Status code of ``GET url`` (0 when it could not connect)."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url), timeout=timeout_s) as resp:  # noqa: S310
+            return int(resp.status)
+    except urllib.error.HTTPError as e:
+        return int(e.code)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def normalize_check(spec: dict, *, default_timeout_s: float) -> dict:
+    """``{url|urls, status, run, expect_exit, timeout_s, interval_s}`` with
+    defaults filled in (``urls`` may be a single string); a check needs
+    ``urls`` or ``run``."""
+    if not isinstance(spec, dict):
+        raise TypeError("check must be a mapping")
+    urls = spec.get("urls") or ([spec["url"]] if spec.get("url") else [])
+    if isinstance(urls, str):
+        urls = [urls]
+    urls = [str(u) for u in urls]
+    run = spec.get("run")
+    if not urls and not run:
+        raise ValueError("check needs 'urls' (or 'url') and/or 'run'")
+    timeout_s = spec.get("timeout_s", default_timeout_s)
+    return {
+        "urls": urls, "status": int(spec.get("status", 200)),
+        "run": run, "expect_exit": int(spec.get("expect_exit", 0)),
+        "timeout_s": float(timeout_s), "interval_s": float(spec.get("interval_s", DEFAULT_INTERVAL_S)),
+    }
+
+
+def _check_once(spec: dict, *, arm: str, rep: Optional[int], env: dict[str, str],
+                log_path: str, timeout_s: float) -> dict:
+    rec: dict[str, Any] = {"urls": [], "run": None, "ok": True, "error": None}
+    for u in spec["urls"]:
+        status = http_status(u, min(timeout_s, 30.0))
+        ok = status == spec["status"]
+        rec["urls"].append({"url": u, "status": status, "expected": spec["status"], "ok": ok})
+        if not ok:
+            rec["ok"] = False
+    if spec["run"]:
+        run_rec = run_hook(spec["run"], arm=arm, rep=rep, env=env, log_path=log_path,
+                           timeout_s=timeout_s)
+        rec["run"] = run_rec
+        if run_rec["exit_code"] != spec["expect_exit"] or run_rec["error"]:
+            rec["ok"] = False
+    if not rec["ok"]:
+        bad = [f"{x['url']} -> {x['status']} (expected {x['expected']})" for x in rec["urls"] if not x["ok"]]
+        if rec["run"] and not rec["run"].get("exit_code") == spec["expect_exit"]:
+            bad.append(f"{spec['run']!r} -> exit {rec['run'].get('exit_code')} {rec['run'].get('error') or ''}".rstrip())
+        rec["error"] = "; ".join(bad) or "check failed"
+    return rec
+
+
+def evaluate_check(spec: dict, *, kind: str, arm: str, rep: Optional[int], env: dict[str, str],
+                   log_path: str, timeout_s: float, poll: bool) -> dict:
+    """Run a readiness / teardown check. With ``poll`` (readiness) retry
+    every ``interval_s`` until it passes or the check's ``timeout_s``
+    (``spec``'s own, else the ``timeout_s`` fallback) elapses; otherwise run
+    once. The record carries every URL's status, the command's exit code and
+    log tail, attempts and elapsed time."""
+    budget = float(spec.get("timeout_s", timeout_s))
+    t0 = time.monotonic()
+    deadline = t0 + budget
+    attempts = 0
+    while True:
+        attempts += 1
+        rec = _check_once(spec, arm=arm, rep=rep, env=env, log_path=log_path,
+                          timeout_s=max(deadline - time.monotonic(), 0.05))
+        if rec["ok"] or not poll or time.monotonic() + spec["interval_s"] > deadline:
+            break
+        time.sleep(spec["interval_s"])
+    rec.update({"kind": kind, "attempts": attempts, "elapsed_s": time.monotonic() - t0,
+                "timeout_s": budget, "poll": poll})
+    if not rec["ok"] and poll:
+        rec["error"] = f"not ready after {attempts} attempt(s) / {rec['elapsed_s']:.0f}s: {rec['error']}"
+    return rec
+
+
+def stops_after(arm: ArmSpec, plan: list[tuple[int, str]], index: int) -> bool:
+    """Whether the launch must be torn down after ``plan[index]`` under the
+    arm's ``relaunch`` mode (starting is positional too — before every entry
+    of an arm that is not live):
+
+    * ``every_rep``: after every rep.
+    * ``visit``: when the next entry is another arm (or there is none), so in
+      ABBA order the GPUs are free before the other arm starts.
+    * ``once``: never here — the runner stops it in its ``finally``.
+    """
+    rep, name = plan[index]
+    if arm.relaunch == "every_rep":
+        return True
+    if arm.relaunch == "visit":
+        nxt = plan[index + 1][1] if index + 1 < len(plan) else None
+        return nxt != name
+    return False
+
+
+# --------------------------------------------------------------------------- #
 # Execution                                                                    #
 # --------------------------------------------------------------------------- #
 
@@ -197,7 +417,13 @@ class ArmsRunner:
             self.settings.allow_mixed_jobs = bool(allow_mixed_jobs)
         self.root = os.path.join(out_dir, self.run_id)
         self.runs: list[RunRef] = []
-        self.launched: set[str] = set()
+        # Lifecycle bookkeeping (#9): arms whose launch is up (-> the latest
+        # rep it served), the hook records of the current launch, and the
+        # bundles written under it.
+        self.live: dict[str, int] = {}
+        self.launched: set[str] = set()          # arms that were ever started (compat)
+        self.launch_hooks: dict[str, dict] = {}
+        self.launch_bundles: dict[str, list[str]] = {}
         self.log_lines: list[str] = []
 
     # -- helpers ----------------------------------------------------------
@@ -206,6 +432,10 @@ class ArmsRunner:
         if self.progress:
             _logger.info(msg)
 
+    def _warn(self, msg: str) -> None:
+        self.log_lines.append(msg)
+        _logger.warning(msg)
+
     def arm_dir(self, arm: str) -> str:
         return os.path.join(self.root, "arms", arm)
 
@@ -213,24 +443,129 @@ class ArmsRunner:
         return os.path.join(self.arm_dir(arm), f"rep-{rep}")
 
     def arm_config(self, arm: ArmSpec) -> dict:
-        return deep_merge(self.base_cfg, arm.config)
+        cfg = deep_merge(self.base_cfg, arm.config)
+        if arm.endpoints:
+            cfg["endpoints"] = deep_merge(cfg.get("endpoints") or {}, arm.endpoints)
+        return cfg
 
-    def _launch(self, arm: ArmSpec, rep: int) -> None:
-        if not arm.launch:
-            return
-        if arm.relaunch == "once" and arm.name in self.launched:
-            return
-        env = {**os.environ, **arm.env, "BENCHMAKER_ARM": arm.name, "BENCHMAKER_REP": str(rep)}
+    def _hook_log(self, arm: ArmSpec, kind: str, rep: Optional[int]) -> str:
         os.makedirs(self.arm_dir(arm.name), exist_ok=True)
-        log_path = os.path.join(self.arm_dir(arm.name), f"launch-rep-{rep}.log")
-        self._say(f"[arms] launching {arm.name}: {arm.launch}")
-        with open(log_path, "w") as log:
-            proc = subprocess.run(arm.launch, shell=True, env=env, stdout=log,
-                                  stderr=subprocess.STDOUT, cwd=os.getcwd(),
-                                  timeout=self.settings.launch_timeout_s)
-        if proc.returncode != 0:
-            raise RuntimeError(f"launch hook for arm {arm.name!r} failed (exit {proc.returncode}); see {log_path}")
+        suffix = f"rep-{rep}" if rep is not None else "final"
+        return os.path.join(self.arm_dir(arm.name), f"{kind}-{suffix}.log")
+
+    # -- lifecycle (#9) -----------------------------------------------------
+    async def _start(self, arm: ArmSpec, rep: int) -> list[dict]:
+        """Bring the arm up for ``rep`` if it is not live. Returns void
+        violations (a failed ``ready_check``). A start hook that exits non-zero
+        is fatal: the launch is torn down and the run aborted. Hooks and
+        checks run in a worker thread so the event loop stays alive."""
+        import asyncio
+
+        if arm.name in self.live:
+            return []
+        hooks: dict[str, Any] = {}
+        s = self.settings
+        if arm.start:
+            rec = await asyncio.to_thread(
+                run_hook, arm.start, arm=arm.name, rep=rep, env=arm.env,
+                log_path=self._hook_log(arm, "launch", rep), timeout_s=s.launch_timeout_s)
+            hooks["start"] = rec
+            self._say(f"[arms] starting {arm.name}: {arm.start} -> exit {rec['exit_code']} "
+                      f"in {rec['duration_s']:.1f}s ({rec['log']})")
+            if rec["exit_code"] != 0:
+                self._say(f"[arms] start hook for {arm.name} failed; running stop hook before aborting")
+                self.live[arm.name] = rep
+                self.launch_hooks[arm.name] = hooks
+                self.launch_bundles[arm.name] = []
+                await self._stop(arm, rep)
+                raise RuntimeError(f"start hook for arm {arm.name!r} failed (exit {rec['exit_code']}); "
+                                   f"see {rec['log']}")
+        self.live[arm.name] = rep
         self.launched.add(arm.name)
+        self.launch_bundles[arm.name] = []
+        violations: list[dict] = []
+        if arm.ready_check:
+            spec = normalize_check(arm.ready_check, default_timeout_s=s.ready_timeout_s)
+            rec = await asyncio.to_thread(
+                evaluate_check, spec, kind="ready_check", arm=arm.name, rep=rep, env=arm.env,
+                log_path=self._hook_log(arm, "ready-check", rep),
+                timeout_s=s.ready_timeout_s, poll=True)
+            hooks["ready_check"] = rec
+            if rec["ok"]:
+                self._say(f"[arms] {arm.name} ready after {rec['elapsed_s']:.1f}s")
+            else:
+                self._warn(f"[arms] {arm.name} NOT ready: {rec['error']} -> rep-{rep} is void")
+                violations.append(hook_violation("ready_check", rec["error"], arm=arm.name, rep=rep))
+        self.launch_hooks[arm.name] = hooks
+        return violations
+
+    async def _stop(self, arm: ArmSpec, rep: int, *, final: bool = False) -> list[dict]:
+        """Tear the launch down: stop hook (with ``stop_timeout_s``), then
+        ``post_stop_check``. Returns void violations, which are applied to
+        every bundle written under this launch."""
+        import asyncio
+
+        if arm.name not in self.live:
+            return []
+        s = self.settings
+        hooks: dict[str, Any] = {}
+        if arm.stop:
+            rec = await asyncio.to_thread(
+                run_hook, arm.stop, arm=arm.name, rep=rep, env=arm.env,
+                log_path=self._hook_log(arm, "stop", None if final else rep),
+                timeout_s=s.stop_timeout_s)
+            hooks["stop"] = rec
+            self._say(f"[arms] stopping {arm.name}: {arm.stop} -> exit {rec['exit_code']} "
+                      f"in {rec['duration_s']:.1f}s ({rec['log']})")
+            if rec["exit_code"] != 0:
+                self._warn(f"[arms] stop hook for {arm.name} failed: exit {rec['exit_code']} "
+                           f"{rec['error'] or ''} (see {rec['log']})")
+                hooks["stop"]["ok"] = False
+        violations: list[dict] = []
+        if arm.post_stop_check:
+            spec = normalize_check(arm.post_stop_check, default_timeout_s=s.check_timeout_s)
+            rec = await asyncio.to_thread(
+                evaluate_check, spec, kind="post_stop_check", arm=arm.name, rep=rep, env=arm.env,
+                log_path=self._hook_log(arm, "post-stop-check", None if final else rep),
+                timeout_s=s.check_timeout_s, poll=False)
+            hooks["post_stop_check"] = rec
+            if rec["ok"]:
+                self._say(f"[arms] {arm.name} torn down cleanly ({rec['elapsed_s']:.1f}s)")
+            else:
+                self._warn(f"[arms] {arm.name} post_stop_check failed: {rec['error']} -> "
+                           f"voiding {len(self.launch_bundles.get(arm.name) or [])} rep(s)")
+                violations.append(hook_violation("post_stop_check", rec["error"], arm=arm.name, rep=rep))
+        self._apply_to_launch(arm, hooks, violations)
+        self.live.pop(arm.name, None)
+        self.launch_hooks.pop(arm.name, None)
+        self.launch_bundles.pop(arm.name, None)
+        return violations
+
+    def _apply_to_launch(self, arm: ArmSpec, hooks: dict, violations: list[dict]) -> None:
+        """Merge stop-side hook records and void reasons into the bundles the
+        launch produced (they were written before the teardown ran)."""
+        from benchmaker.io.bundle import patch_bundle
+
+        for run_dir in self.launch_bundles.get(arm.name) or []:
+            patch_bundle(run_dir, hooks=hooks or None, void_violations=violations or None)
+        # The RunRefs were built before the teardown ran: reload them so the
+        # comparison sees the amended void verdict.
+        for i, ref in enumerate(self.runs):
+            if ref.bundle_dir in (self.launch_bundles.get(arm.name) or []):
+                self.runs[i] = RunRef.from_bundle(ref.arm, ref.rep, ref.bundle_dir, warmup=ref.warmup)
+
+    async def _stop_all(self) -> None:
+        """Tear every live launch down — the ``finally`` of the run, so
+        failures and interrupts never leave a server behind."""
+        arms = {a.name: a for a in self.settings.arms}
+        for name in list(self.live):
+            arm = arms.get(name)
+            if arm is None:
+                continue
+            try:
+                await self._stop(arm, self.live[name], final=True)
+            except Exception as e:  # noqa: BLE001 - teardown must not mask the original error
+                self._warn(f"[arms] stop hook for {name} raised {type(e).__name__}: {e}")
 
     # -- main -------------------------------------------------------------
     def run(self) -> dict:
@@ -257,31 +592,40 @@ class ArmsRunner:
 
         arms_by_name = {a.name: a for a in s.arms}
         t_all = time.monotonic()
-        for i, (rep, name) in enumerate(plan, 1):
-            arm = arms_by_name[name]
-            self._launch(arm, rep)
-            cfg_dict = self.arm_config(arm)
-            warm = rep < s.warmup_reps
-            labels = {**self.labels, **arm.labels, "arm": name, "rep": rep}
-            if warm:
-                labels["warmup"] = "true"
-            t0 = time.monotonic()
-            self._say(f"[arms] ({i}/{len(plan)}) arm={name} rep={rep}{' warmup' if warm else ''}")
-            bench_cfg = build_config(cfg_dict, dotenv_path=self.dotenv_path)
-            if self.quiet:
-                bench_cfg.progress_every_s = 0.0
-            runner = BenchRunner(bench_cfg)
-            await runner.run()
-            source_config = {**cfg_dict, "arm": name, "rep": rep, "warmup": warm}
-            run_dir = runner.write_bundle(
-                self.arm_dir(name), run_id=f"rep-{rep}",
-                source_config=source_config, labels=labels, notes=self.notes,
-                env_overrides=dict(arm.env) or None,
-            )
-            self.runs.append(RunRef.from_bundle(name, rep, run_dir, warmup=warm))
-            m = runner.metrics
-            self._say(f"[arms] done {name}/rep-{rep}: {m.summary().get('total_requests')} requests "
-                      f"in {time.monotonic() - t0:.1f}s -> {run_dir}")
+        try:
+            for i, (rep, name) in enumerate(plan, 1):
+                arm = arms_by_name[name]
+                violations = await self._start(arm, rep)
+                self.live[name] = rep  # the rep a forced teardown will be attributed to
+                cfg_dict = self.arm_config(arm)
+                warm = rep < s.warmup_reps
+                labels = {**self.labels, **arm.labels, "arm": name, "rep": rep}
+                if warm:
+                    labels["warmup"] = "true"
+                t0 = time.monotonic()
+                self._say(f"[arms] ({i}/{len(plan)}) arm={name} rep={rep}{' warmup' if warm else ''}")
+                bench_cfg = build_config(cfg_dict, dotenv_path=self.dotenv_path)
+                if self.quiet:
+                    bench_cfg.progress_every_s = 0.0
+                bench_cfg.extra_void.extend(violations)
+                runner = BenchRunner(bench_cfg)
+                await runner.run()
+                source_config = {**cfg_dict, "arm": name, "rep": rep, "warmup": warm}
+                run_dir = runner.write_bundle(
+                    self.arm_dir(name), run_id=f"rep-{rep}",
+                    source_config=source_config, labels=labels, notes=self.notes,
+                    env_overrides=dict(arm.env) or None,
+                    hooks=dict(self.launch_hooks.get(name) or {}) or None,
+                )
+                self.launch_bundles.setdefault(name, []).append(run_dir)
+                self.runs.append(RunRef.from_bundle(name, rep, run_dir, warmup=warm))
+                m = runner.metrics
+                self._say(f"[arms] done {name}/rep-{rep}: {m.summary().get('total_requests')} requests "
+                          f"in {time.monotonic() - t0:.1f}s -> {run_dir}")
+                if stops_after(arm, plan, i - 1):
+                    await self._stop(arm, rep)
+        finally:
+            await self._stop_all()
 
         result = self.compare()
         write_comparison(result, self.root)
@@ -292,7 +636,6 @@ class ArmsRunner:
 
     def compare(self) -> dict:
         return build_comparison(self.runs, self.settings)
-
 
     def exit_code(self, result: dict) -> int:
         if result.get("same_job_violations") and not self.settings.allow_mixed_jobs:

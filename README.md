@@ -166,14 +166,16 @@ Full docs live in [`docs/`](docs/):
   pooled ITL percentiles, stall accounting, per-cache-class summaries and the
   TTFT mix/latency decomposition
 - [Capability, manifest, void runs](docs/capability-manifest.md) — server
-  self-description snapshots, `manifest.json`, `void_rules`
+  self-description snapshots (per endpoint), `manifest.json`, `void_rules`
 - [Phases, warm-up, capacity-revisit](docs/phases-capacity.md) — timed stages
   with their own lanes, excluded warm-up, and the warm/revisit working-set
   workload
 - [Multi-arm comparisons](docs/arms.md) — `benchmaker arms` / `compare`:
-  interleaved reps, per-rep bundles, same-job enforcement, comparison table
+  interleaved reps, per-rep bundles, same-job enforcement, comparison table,
+  start/stop/readiness lifecycle hooks, one server per model (`endpoints:`)
 - [Replaying published traces](docs/trace-replay.md) — Mooncake (block-hash
-  prefix structure) and Azure LLM inference traces with real arrival times
+  prefix structure, or `send: token_ids` for page-aligned token-id replay)
+  and Azure LLM inference traces with real arrival times
 
 ## Deterministic replay (`swebench-replay`)
 

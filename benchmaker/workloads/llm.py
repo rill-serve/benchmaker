@@ -1,4 +1,14 @@
-"""OpenAI-compatible chat-completions workload-type (with SSE streaming).
+"""OpenAI-compatible completions workload-types (with SSE streaming).
+
+Two classes share the metrics below:
+
+* :class:`OpenAIChatWorkloadType` — ``/v1/chat/completions`` (``type: openai``).
+* :class:`OpenAICompletionsWorkloadType` — ``/v1/completions`` (``type:
+  openai-completions``), the text-completions wire format. Its ``prompt`` may
+  be a string or a list of token ids, which is how ``send: token_ids`` trace
+  replay ships pre-tokenized, page-aligned blocks without a chat template
+  (issue #11).
+
 
 Item interpretation:
   * `str`            → wrap as `[{"role": "user", "content": item}]`
@@ -55,6 +65,7 @@ import json
 import logging
 import os
 import statistics
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Union
 
 from benchmaker.env import load_dotenv
@@ -165,6 +176,11 @@ class OpenAIChatWorkloadType(WorkloadType):
     def model(self) -> Optional[str]:
         """Model id placed in the request body (used by the run manifest, #4)."""
         return self._model
+
+    @property
+    def url(self) -> str:
+        """Chat-completions URL; the path every ``endpoints:`` base URL (#8) inherits."""
+        return self._url
 
     @classmethod
     def from_env(
@@ -300,210 +316,266 @@ class OpenAIChatWorkloadType(WorkloadType):
     async def make_sample(self, item: Any, request: Request, response: Response,
                           start_ts: float) -> Sample:
         sample = await super().make_sample(item, request, response, start_ts)
+        stats = parse_chat_stream(response.stream_chunks or [], response.stream_chunk_times or [])
+        return finish_llm_sample(
+            sample, request, response, stats, ttft_token=self._ttft_token,
+            cache_classifier=self._cache_classifier,
+            cache_full_hit_ratio=self._cache_full_hit_ratio)
 
-        chunks = response.stream_chunks or []
-        chunk_times = response.stream_chunk_times or []
-        # First token of *any* kind (reasoning or content): the engine-cost
-        # signal a serving benchmark wants — when the server began producing
-        # output, isolating prefill→decode from the model's reasoning policy.
-        first_token: Optional[float] = None
-        # First *visible* (content) token: the latency a user perceives before
-        # an answer appears. Tracked separately so it's surfaced as
-        # `content_ttft_s` even when `ttft_token="any"` (#14).
-        first_content_token: Optional[float] = None
-        # Every token the stream produced, reasoning and content alike, so
-        # inter-token latency reflects true decode cadence across the whole
-        # generation instead of conflating the reasoning phase.
-        token_arrival_times: list[float] = []
-        token_kinds: list[str] = []
-        usage_completion_tokens: Optional[int] = None
-        reasoning_tokens: Optional[int] = None
-        prompt_tokens: Optional[int] = None
-        cached_tokens: Optional[int] = None
-        restored_tokens: Optional[int] = None
-        cache_hint: Optional[str] = None
-        finish_reason: Optional[str] = None
-        usage_seen = False
-        usage_raw: dict = {}
 
-        # Reassemble across chunk boundaries first: httpx2's aiter_raw()
-        # yields bytes at arbitrary offsets, so the final `usage` event is
-        # often split in two and would be silently dropped if each chunk were
-        # parsed on its own (#13).
-        for line, t in reassemble_sse_lines(chunks, chunk_times):
-            line = line.strip()
-            if not line:
-                continue
-            if line.startswith(b"data:"):
-                line = line[5:].strip()
-            if line == b"[DONE]":
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            if obj.get("usage"):
-                usage_seen = True
-                u = obj["usage"]
-                usage_raw = dict(u) if isinstance(u, dict) else {}
-                if u.get("completion_tokens") is not None:
-                    usage_completion_tokens = int(u["completion_tokens"])
-                if u.get("prompt_tokens") is not None:
-                    prompt_tokens = int(u["prompt_tokens"])
-                details = u.get("prompt_tokens_details")
-                if isinstance(details, dict) and details.get("cached_tokens") is not None:
-                    cached_tokens = int(details["cached_tokens"])
-                elif u.get("cached_tokens") is not None:
-                    cached_tokens = int(u["cached_tokens"])
-                # Which tier served the cached prefix (device / host / remote),
-                # when the server says so: usage, prompt_tokens_details or
-                # response headers (issue #2). Also restored-from-host counts.
-                for src in (u, details if isinstance(details, dict) else None):
-                    if isinstance(src, dict):
-                        if restored_tokens is None and src.get("restored_tokens") is not None:
-                            restored_tokens = int(src["restored_tokens"])
-                        if cache_hint is None:
-                            cache_hint = _cache_source_of(src)
-                if cache_hint is None:
-                    cache_hint = _cache_source_of(dict(response.headers or {}))
-                # Thinking models report generated reasoning tokens separately
-                # from visible content; surfacing the breakdown keeps tokens_out
-                # honest and exposes the reasoning share (#14).
-                details = u.get("completion_tokens_details")
-                if isinstance(details, dict) and details.get("reasoning_tokens") is not None:
-                    reasoning_tokens = int(details["reasoning_tokens"])
-            for ch in obj.get("choices") or []:
-                delta = ch.get("delta") or {}
-                # Count reasoning tokens the same as content tokens: a thinking
-                # model streams its chain-of-thought in `reasoning_content`
-                # before any `content`, and those bytes are real engine output.
-                # Without this, ttft/itl/tokens are wrong for the whole class of
-                # reasoning models (#14).
-                content_piece = delta.get("content")
-                reasoning_piece = delta.get("reasoning_content")
-                if content_piece:
-                    if first_token is None:
-                        first_token = t
-                    if first_content_token is None:
-                        first_content_token = t
-                    token_arrival_times.append(t)
-                    token_kinds.append("content")
-                if reasoning_piece:
-                    if first_token is None:
-                        first_token = t
-                    token_arrival_times.append(t)
-                    token_kinds.append("reasoning")
-                if ch.get("finish_reason"):
-                    finish_reason = ch["finish_reason"]
+# --------------------------------------------------------------------------- #
+# Stream parsing shared by the chat and completions workload-types            #
+# --------------------------------------------------------------------------- #
 
-        # Loud-but-once diagnostic: a benchmark that requested usage yet parsed
-        # none produces a structurally-zero cache hit rate — surface it instead
-        # of silently recording misleading metrics.
-        if response.ok and not usage_seen:
-            _warn_missing_usage_once(request)
 
-        # When the endpoint omits `usage`, fall back to the count of streamed
-        # tokens — which now includes reasoning tokens, so a thinking model is
-        # no longer undercounted by its entire chain-of-thought (#14).
-        completion_tokens = (
-            usage_completion_tokens
-            if usage_completion_tokens is not None
-            else len(token_arrival_times)
+@dataclass
+class _StreamStats:
+    """What one streamed OpenAI completion told us, independent of wire format."""
+    first_token: Optional[float] = None            # first token of any kind
+    first_content_token: Optional[float] = None    # first visible token
+    token_arrival_times: list = field(default_factory=list)
+    token_kinds: list = field(default_factory=list)
+    usage_completion_tokens: Optional[int] = None
+    reasoning_tokens: Optional[int] = None
+    prompt_tokens: Optional[int] = None
+    cached_tokens: Optional[int] = None
+    restored_tokens: Optional[int] = None
+    cache_hint: Optional[str] = None
+    finish_reason: Optional[str] = None
+    usage_seen: bool = False
+    usage_raw: dict = field(default_factory=dict)
+
+
+def _iter_sse_objects(chunks: list, chunk_times: list):
+    """Reassemble across chunk boundaries first: httpx2's aiter_raw() yields
+    bytes at arbitrary offsets, so the final `usage` event is often split in
+    two and would be silently dropped if each chunk were parsed on its own
+    (#13). Yields ``(obj, arrival_time)``."""
+    for line, t in reassemble_sse_lines(chunks, chunk_times):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(b"data:"):
+            line = line[5:].strip()
+        if line == b"[DONE]":
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            yield obj, t
+
+
+def _absorb_usage(obj: dict, st: _StreamStats) -> None:
+    u = obj.get("usage")
+    if not u:
+        return
+    st.usage_seen = True
+    if not isinstance(u, dict):
+        return
+    st.usage_raw = dict(u)
+    if u.get("completion_tokens") is not None:
+        st.usage_completion_tokens = int(u["completion_tokens"])
+    if u.get("prompt_tokens") is not None:
+        st.prompt_tokens = int(u["prompt_tokens"])
+    details = u.get("prompt_tokens_details")
+    if isinstance(details, dict) and details.get("cached_tokens") is not None:
+        st.cached_tokens = int(details["cached_tokens"])
+    elif u.get("cached_tokens") is not None:
+        st.cached_tokens = int(u["cached_tokens"])
+    # Which tier served the cached prefix (device / host / remote), when the
+    # server says so: usage, prompt_tokens_details or response headers
+    # (issue #2). Also restored-from-host counts.
+    for src in (u, details if isinstance(details, dict) else None):
+        if isinstance(src, dict):
+            if st.restored_tokens is None and src.get("restored_tokens") is not None:
+                st.restored_tokens = int(src["restored_tokens"])
+            if st.cache_hint is None:
+                st.cache_hint = _cache_source_of(src)
+    # Thinking models report generated reasoning tokens separately from
+    # visible content; surfacing the breakdown keeps tokens_out honest and
+    # exposes the reasoning share (#14).
+    details = u.get("completion_tokens_details")
+    if isinstance(details, dict) and details.get("reasoning_tokens") is not None:
+        st.reasoning_tokens = int(details["reasoning_tokens"])
+
+
+def parse_chat_stream(chunks: list, chunk_times: list) -> _StreamStats:
+    """``/v1/chat/completions`` SSE: ``choices[*].delta.content`` and
+    ``.reasoning_content`` are the produced tokens; the final event carries
+    ``usage`` when ``stream_options.include_usage`` was requested."""
+    st = _StreamStats()
+    for obj, t in _iter_sse_objects(chunks, chunk_times):
+        _absorb_usage(obj, st)
+        for ch in obj.get("choices") or []:
+            delta = ch.get("delta") or {}
+            # Count reasoning tokens the same as content tokens: a thinking
+            # model streams its chain-of-thought in `reasoning_content`
+            # before any `content`, and those bytes are real engine output.
+            # Without this, ttft/itl/tokens are wrong for the whole class of
+            # reasoning models (#14).
+            content_piece = delta.get("content")
+            reasoning_piece = delta.get("reasoning_content")
+            if content_piece:
+                if st.first_token is None:
+                    st.first_token = t
+                if st.first_content_token is None:
+                    st.first_content_token = t
+                st.token_arrival_times.append(t)
+                st.token_kinds.append("content")
+            if reasoning_piece:
+                if st.first_token is None:
+                    st.first_token = t
+                st.token_arrival_times.append(t)
+                st.token_kinds.append("reasoning")
+            if ch.get("finish_reason"):
+                st.finish_reason = ch["finish_reason"]
+    return st
+
+
+def parse_completions_stream(chunks: list, chunk_times: list) -> _StreamStats:
+    """``/v1/completions`` SSE: ``choices[*].text`` is the produced delta; the
+    final event carries ``usage`` (vLLM/SGLang honour ``stream_options.
+    include_usage`` here too). Chunks with empty ``text`` (e.g. the closing
+    ``finish_reason`` event) are not token arrivals."""
+    st = _StreamStats()
+    for obj, t in _iter_sse_objects(chunks, chunk_times):
+        _absorb_usage(obj, st)
+        for ch in obj.get("choices") or []:
+            piece = ch.get("text")
+            if piece:
+                if st.first_token is None:
+                    st.first_token = t
+                if st.first_content_token is None:
+                    st.first_content_token = t
+                st.token_arrival_times.append(t)
+                st.token_kinds.append("content")
+            if ch.get("finish_reason"):
+                st.finish_reason = ch["finish_reason"]
+    return st
+
+
+def finish_llm_sample(sample: Sample, request: Request, response: Response, st: _StreamStats, *,
+                      ttft_token: str = "any",
+                      cache_classifier: Optional[Callable[[CacheClassInfo], Optional[str]]] = None,
+                      cache_full_hit_ratio: float = 0.9) -> Sample:
+    """Turn parsed stream statistics into the shared LLM metrics on ``sample``
+    (ttft/itl/tokens/cache class/trace fields) — used by every streaming
+    OpenAI-style workload-type so their metrics mean the same thing."""
+    first_token, first_content_token = st.first_token, st.first_content_token
+    token_arrival_times, token_kinds = st.token_arrival_times, st.token_kinds
+    prompt_tokens, cached_tokens = st.prompt_tokens, st.cached_tokens
+    cache_hint, finish_reason = st.cache_hint, st.finish_reason
+    usage_raw = st.usage_raw
+
+    # Loud-but-once diagnostic: a benchmark that requested usage yet parsed
+    # none produces a structurally-zero cache hit rate — surface it instead
+    # of silently recording misleading metrics.
+    if response.ok and not st.usage_seen:
+        _warn_missing_usage_once(request)
+
+    # When the endpoint omits `usage`, fall back to the count of streamed
+    # tokens — which now includes reasoning tokens, so a thinking model is
+    # no longer undercounted by its entire chain-of-thought (#14).
+    completion_tokens = (
+        st.usage_completion_tokens if st.usage_completion_tokens is not None
+        else len(token_arrival_times)
+    )
+    if cache_hint is None:
+        cache_hint = _cache_source_of(dict(response.headers or {}))
+
+    # `ttft_token` selects which token the headline `ttft_s` is measured
+    # to. The first-content time is always surfaced separately as
+    # `content_ttft_s` when it is a distinct instant, so a serving run
+    # (ttft = first-any token) also captures perceived latency.
+    ttft = first_content_token if ttft_token == "content" else first_token
+    if ttft is not None:
+        sample.extra["ttft_s"] = ttft
+        # Provenance of the headline TTFT: which token it was stamped on
+        # and where in the stream. A TTFT that dropped because a reasoning
+        # token now arrives first is not a prefill win (issue #4).
+        idx = _first_index(token_arrival_times, ttft)
+        kind = token_kinds[idx] if idx is not None else None
+        if kind is not None:
+            sample.meta["ttft_token_kind"] = kind
+        if idx is not None:
+            sample.meta["ttft_token_index"] = idx
+            sample.extra["ttft_token_index"] = float(idx)
+    if first_content_token is not None and first_content_token != ttft:
+        sample.extra["content_ttft_s"] = first_content_token
+
+    if len(token_arrival_times) >= 2:
+        itl = [
+            (token_arrival_times[i] - token_arrival_times[i - 1]) * 1000.0
+            for i in range(1, len(token_arrival_times))
+        ]
+        sample.extra["itl_ms_mean"] = statistics.mean(itl)
+        sample.extra["itl_ms_p50"] = _pct(itl, 50)
+        sample.extra["itl_ms_p99"] = _pct(itl, 99)
+        # Raw gaps: pooled across requests by the summary (issue #1).
+        sample.series[ITL_SERIES] = itl
+
+    sample.extra["tokens_out"] = float(completion_tokens)
+    # Surface the reasoning/content breakdown from `usage` when the server
+    # reports it, so a run can see how much of the generation was thinking
+    # vs. the visible answer (#14).
+    if st.reasoning_tokens is not None:
+        sample.extra["reasoning_tokens"] = float(st.reasoning_tokens)
+        if completion_tokens >= st.reasoning_tokens:
+            sample.extra["content_tokens"] = (
+                float(completion_tokens) - float(st.reasoning_tokens))
+    if prompt_tokens is not None:
+        sample.extra["prompt_tokens"] = float(prompt_tokens)
+    if cached_tokens is not None:
+        sample.extra["cached_tokens"] = float(cached_tokens)
+    if cached_tokens is not None and prompt_tokens:
+        sample.extra["cached_ratio"] = float(cached_tokens) / float(prompt_tokens)
+    # Cache class (issue #2): device_hit / restore / partial / miss. Only
+    # classifiable when the server reported a usage block.
+    if response.ok and prompt_tokens is not None:
+        info = CacheClassInfo(
+            prompt_tokens=prompt_tokens,
+            cached_tokens=cached_tokens or 0,
+            restored_tokens=st.restored_tokens,
+            hint=cache_hint,
+            usage=_usage_cache_fields(usage_raw),
+            headers=dict(response.headers or {}),
         )
+        cache_class = (
+            cache_classifier(info) if cache_classifier
+            else classify_cache(info, cache_full_hit_ratio)
+        )
+        if cache_class is not None:
+            sample.meta["cache_class"] = cache_class
+        if cache_hint is not None:
+            sample.meta["cache_hint"] = cache_hint
+    # Dataset workloads can provide a pre-run prompt-size estimate and a
+    # RAG packing depth through Request.meta. Preserve them as numeric
+    # metrics even when an endpoint omits usage information.
+    for metric in ("prompt_tokens_hint", "prefix_tokens_hint", "rag_depth"):
+        value = request.meta.get(metric)
+        if isinstance(value, (int, float)):
+            sample.extra[metric] = float(value)
+    # Numeric trace fields (trace_input_tokens, trace_output_tokens,
+    # trace_blocks, ...) become metrics too, so a replayed run reports the
+    # trace's token distribution next to what the server measured (#6).
+    for key, value in request.meta.items():
+        if key.startswith("trace_") and isinstance(value, (int, float)) and not isinstance(value, bool):
+            sample.extra[key] = float(value)
 
-        # `ttft_token` selects which token the headline `ttft_s` is measured
-        # to. The first-content time is always surfaced separately as
-        # `content_ttft_s` when it is a distinct instant, so a serving run
-        # (ttft = first-any token) also captures perceived latency.
-        ttft = first_content_token if self._ttft_token == "content" else first_token
-        if ttft is not None:
-            sample.extra["ttft_s"] = ttft
-            # Provenance of the headline TTFT: which token it was stamped on
-            # and where in the stream. A TTFT that dropped because a reasoning
-            # token now arrives first is not a prefill win (issue #4).
-            idx = _first_index(token_arrival_times, ttft)
-            kind = token_kinds[idx] if idx is not None else None
-            if kind is not None:
-                sample.meta["ttft_token_kind"] = kind
-            if idx is not None:
-                sample.meta["ttft_token_index"] = idx
-                sample.extra["ttft_token_index"] = float(idx)
-        if first_content_token is not None and first_content_token != ttft:
-            sample.extra["content_ttft_s"] = first_content_token
+    if completion_tokens > 0 and ttft is not None and response.elapsed_s > ttft:
+        sample.extra["tokens_per_s"] = completion_tokens / (response.elapsed_s - ttft)
+    elif completion_tokens > 0 and response.elapsed_s > 0:
+        sample.extra["tokens_per_s"] = completion_tokens / response.elapsed_s
 
-        if len(token_arrival_times) >= 2:
-            itl = [
-                (token_arrival_times[i] - token_arrival_times[i - 1]) * 1000.0
-                for i in range(1, len(token_arrival_times))
-            ]
-            sample.extra["itl_ms_mean"] = statistics.mean(itl)
-            sample.extra["itl_ms_p50"] = _pct(itl, 50)
-            sample.extra["itl_ms_p99"] = _pct(itl, 99)
-            # Raw gaps: pooled across requests by the summary (issue #1).
-            sample.series[ITL_SERIES] = itl
+    if finish_reason:
+        sample.meta["finish_reason"] = finish_reason
+    if response.ok and completion_tokens == 0:
+        sample.ok = False
+        sample.error = sample.error or "no tokens received"
 
-        sample.extra["tokens_out"] = float(completion_tokens)
-        # Surface the reasoning/content breakdown from `usage` when the server
-        # reports it, so a run can see how much of the generation was thinking
-        # vs. the visible answer (#14).
-        if reasoning_tokens is not None:
-            sample.extra["reasoning_tokens"] = float(reasoning_tokens)
-            if completion_tokens >= reasoning_tokens:
-                sample.extra["content_tokens"] = (
-                    float(completion_tokens) - float(reasoning_tokens))
-        if prompt_tokens is not None:
-            sample.extra["prompt_tokens"] = float(prompt_tokens)
-        if cached_tokens is not None:
-            sample.extra["cached_tokens"] = float(cached_tokens)
-        if cached_tokens is not None and prompt_tokens:
-            sample.extra["cached_ratio"] = float(cached_tokens) / float(prompt_tokens)
-        # Cache class (issue #2): device_hit / restore / partial / miss. Only
-        # classifiable when the server reported a usage block.
-        if response.ok and prompt_tokens is not None:
-            info = CacheClassInfo(
-                prompt_tokens=prompt_tokens,
-                cached_tokens=cached_tokens or 0,
-                restored_tokens=restored_tokens,
-                hint=cache_hint,
-                usage=_usage_cache_fields(usage_raw),
-                headers=dict(response.headers or {}),
-            )
-            cache_class = (
-                self._cache_classifier(info) if self._cache_classifier
-                else classify_cache(info, self._cache_full_hit_ratio)
-            )
-            if cache_class is not None:
-                sample.meta["cache_class"] = cache_class
-            if cache_hint is not None:
-                sample.meta["cache_hint"] = cache_hint
-        # Dataset workloads can provide a pre-run prompt-size estimate and a
-        # RAG packing depth through Request.meta. Preserve them as numeric
-        # metrics even when an endpoint omits usage information.
-        for metric in ("prompt_tokens_hint", "prefix_tokens_hint", "rag_depth"):
-            value = request.meta.get(metric)
-            if isinstance(value, (int, float)):
-                sample.extra[metric] = float(value)
-        # Numeric trace fields (trace_input_tokens, trace_output_tokens,
-        # trace_blocks, ...) become metrics too, so a replayed run reports the
-        # trace's token distribution next to what the server measured (#6).
-        for key, value in request.meta.items():
-            if key.startswith("trace_") and isinstance(value, (int, float)) and not isinstance(value, bool):
-                sample.extra[key] = float(value)
-
-        if completion_tokens > 0 and ttft is not None and response.elapsed_s > ttft:
-            sample.extra["tokens_per_s"] = completion_tokens / (response.elapsed_s - ttft)
-        elif completion_tokens > 0 and response.elapsed_s > 0:
-            sample.extra["tokens_per_s"] = completion_tokens / response.elapsed_s
-
-        if finish_reason:
-            sample.meta["finish_reason"] = finish_reason
-        if response.ok and completion_tokens == 0:
-            sample.ok = False
-            sample.error = sample.error or "no tokens received"
-
-        return sample
+    return sample
 
 # --------------------------------------------------------------------------- #
 # Cache classification (issue #2)                                             #
@@ -645,3 +717,169 @@ def _first_env(keys: tuple[str, ...]) -> Optional[str]:
         if v:
             return v
     return None
+
+
+# --------------------------------------------------------------------------- #
+# /v1/completions (issue #11)                                                  #
+# --------------------------------------------------------------------------- #
+
+_COMPLETIONS_BODY_KEYS = _OPENAI_BODY_KEYS - {"messages", "tools", "tool_choice", "response_format"} | {
+    "prompt", "best_of", "user", "suffix", "echo", "logprobs", "top_logprobs",
+}
+
+
+class OpenAICompletionsWorkloadType(WorkloadType):
+    """OpenAI-compatible ``/v1/completions`` with SSE streaming (vLLM, SGLang,
+    TGI's ``/v1/completions``, OpenAI itself).
+
+    Item interpretation:
+      * ``str``            → ``{"prompt": item}``
+      * ``list[int]``      → ``{"prompt": [token ids]}`` — pre-tokenized
+        prompt; the server skips its tokenizer entirely
+      * ``dict``           → merged into the body; ``prompt`` (str or ids),
+        ``max_tokens`` and sampling keys; a ``meta`` key is carried on the
+        request (recorded, never sent). ``messages`` is rejected — use
+        ``type: openai`` for chat.
+
+    Metrics are the ones documented at the top of this module (``ttft_s``,
+    ``itl_ms_*``, ``tokens_out``, ``prompt_tokens``, ``cached_ratio``,
+    ``cache_class``, ``tokens_per_s``). ``echo`` is refused: echoing the
+    prompt back would stamp TTFT on the prompt and inflate token counts.
+    ``passthrough_meta`` behaves as for chat (allowlisted body keys, a row
+    ``model`` kept as ``meta.model_label``).
+    """
+
+    streaming = True
+    name = "openai-completions"
+
+    def __init__(
+        self,
+        url: str,
+        model: str,
+        max_tokens: int = 128,
+        temperature: float = 0.0,
+        extra_body: Optional[dict] = None,
+        headers: Optional[dict[str, str]] = None,
+        api_key: Optional[str] = None,
+        timeout_s: Optional[float] = 600.0,
+        name: str = "openai-completions",
+        passthrough_meta: bool = False,
+        cache_classifier: Optional[Callable[[CacheClassInfo], Optional[str]]] = None,
+        cache_full_hit_ratio: float = 0.9,
+        **sampling: Any,
+    ):
+        if not 0.0 < cache_full_hit_ratio <= 1.0:
+            raise ValueError(f"cache_full_hit_ratio must be in (0, 1], got {cache_full_hit_ratio!r}")
+        merged: dict[str, Any] = dict(extra_body or {})
+        merged.update(sampling)
+        if merged.get("echo"):
+            raise ValueError("echo=True would stream the prompt back and corrupt ttft/itl/token counts")
+        self.name = name
+        self._url = url
+        self._model = model
+        self._max_tokens = max_tokens
+        self._temperature = temperature
+        self._passthrough_meta = passthrough_meta
+        self._extra_body = merged
+        self._timeout_s = timeout_s
+        self._cache_classifier = cache_classifier
+        self._cache_full_hit_ratio = float(cache_full_hit_ratio)
+        hdrs = dict(headers or {})
+        hdrs.setdefault("Content-Type", "application/json")
+        hdrs.setdefault("Accept", "text/event-stream")
+        if api_key:
+            hdrs.setdefault("Authorization", f"Bearer {api_key}")
+        self._headers = hdrs
+
+    @property
+    def model(self) -> Optional[str]:
+        return self._model
+
+    @property
+    def url(self) -> str:
+        return self._url
+
+    @classmethod
+    def from_env(cls, url: Optional[str] = None, model: Optional[str] = None,
+                 api_key: Optional[str] = None, dotenv_path: Optional[str] = ".env",
+                 endpoint_path: str = "completions", **kwargs: Any) -> "OpenAICompletionsWorkloadType":
+        chat = OpenAIChatWorkloadType.from_env(url=url, model=model, api_key=api_key,
+                                               dotenv_path=dotenv_path,
+                                               endpoint_path=endpoint_path, **kwargs)
+        return cls(url=chat._url, model=chat.model, api_key=api_key, **kwargs)
+
+    def _split_passthrough(self, item: dict) -> tuple[dict, dict]:
+        allowed = _COMPLETIONS_BODY_KEYS | set(self._extra_body.keys())
+        body_part: dict[str, Any] = {}
+        meta_part: dict[str, Any] = {}
+        for k, v in item.items():
+            if k == "meta" and isinstance(v, dict):
+                meta_part.update(v)
+            elif k == "model":
+                meta_part["model_label"] = v
+            elif k == "max_new_tokens" and "max_tokens" not in item:
+                body_part["max_tokens"] = v
+            elif k in allowed:
+                body_part[k] = v
+            else:
+                meta_part[k] = v
+        return body_part, meta_part
+
+    async def make_request(self, item: Any) -> Request:
+        body: dict[str, Any] = {
+            "model": self._model,
+            "stream": True,
+            "max_tokens": self._max_tokens,
+            "temperature": self._temperature,
+            **self._extra_body,
+        }
+        body.setdefault("stream_options", {"include_usage": True})
+        meta_extra: dict[str, Any] = {}
+
+        if item is None:
+            body["prompt"] = ""
+        elif isinstance(item, str):
+            body["prompt"] = item
+        elif isinstance(item, list) and all(isinstance(t, int) and not isinstance(t, bool) for t in item):
+            body["prompt"] = list(item)
+        elif isinstance(item, dict):
+            if self._passthrough_meta:
+                item, meta_extra = self._split_passthrough(item)
+            else:
+                item = dict(item)
+                item_meta = item.pop("meta", None)
+                if isinstance(item_meta, dict):
+                    meta_extra.update(item_meta)
+            if "messages" in item and "prompt" not in item:
+                raise TypeError("OpenAICompletionsWorkloadType got chat `messages`; use type: openai")
+            body.update(item)
+            body.setdefault("prompt", "")
+        else:
+            raise TypeError(f"OpenAICompletionsWorkloadType cannot interpret item {type(item).__name__}")
+
+        prompt = body["prompt"]
+        meta: dict[str, Any] = dict(meta_extra)
+        is_ids = isinstance(prompt, list)
+        meta["prompt_kind"] = "token_ids" if is_ids else "text"
+        # The prompt itself is not copied into meta (token-id prompts run to
+        # tens of thousands of ints per request); its size is.
+        meta["prompt_len"] = len(prompt) if is_ids else len(str(prompt))
+        meta["prompt_tokens_hint"] = len(prompt) if is_ids else meta.get("prompt_tokens_hint")
+        meta["max_tokens"] = body.get("max_tokens")
+        return Request(
+            method="POST",
+            url=self._url,
+            headers=dict(self._headers),
+            json=body,
+            timeout_s=self._timeout_s,
+            meta=meta,
+        )
+
+    async def make_sample(self, item: Any, request: Request, response: Response,
+                          start_ts: float) -> Sample:
+        sample = await super().make_sample(item, request, response, start_ts)
+        stats = parse_completions_stream(response.stream_chunks or [], response.stream_chunk_times or [])
+        return finish_llm_sample(
+            sample, request, response, stats, ttft_token="any",
+            cache_classifier=self._cache_classifier,
+            cache_full_hit_ratio=self._cache_full_hit_ratio)

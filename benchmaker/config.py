@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional
 
 from benchmaker.env import interpolate, load_dotenv
 from benchmaker.core.capability import parse_void_rules
+from benchmaker.core.endpoints import normalize_endpoints
 from benchmaker.core.load import TraceArrivalsLoad, parse_duration, parse_rate_spec
 from benchmaker.core.monitors import FunctionMonitor, Monitor, PrometheusMonitor
 from benchmaker.core.runner import BenchConfig, BenchLane, BenchPhase
@@ -37,7 +38,7 @@ from benchmaker.workloads.tracelab import TraceLabWorkload
 from benchmaker.workloads.traces import trace_replay_from_spec
 from benchmaker.workloads.capacity import CapacityRevisitWorkload
 from benchmaker.workloads.http import HttpWorkloadType
-from benchmaker.workloads.llm import OpenAIChatWorkloadType
+from benchmaker.workloads.llm import OpenAIChatWorkloadType, OpenAICompletionsWorkloadType
 from benchmaker.workloads.sandbox import SandboxWorkloadType
 from benchmaker.workloads.agent import Agent, AgentWorkloadType
 from benchmaker.workloads.eval import (
@@ -93,6 +94,8 @@ def build_workload_type(spec: dict) -> WorkloadType:
         return HttpWorkloadType(**kwargs)
     if t in ("openai", "openai-chat", "llm-chat", "llm"):
         return OpenAIChatWorkloadType(**kwargs)
+    if t in ("openai-completions", "completions", "openai-text", "text-completions"):
+        return OpenAICompletionsWorkloadType(**kwargs)
     if t in ("sglang", "sglang-generate"):
         from benchmaker.workloads.sglang import SGLangGenerateWorkloadType
         return SGLangGenerateWorkloadType(**kwargs)
@@ -406,7 +409,8 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
             # (has 'type: http' or 'type: openai'), accept it.
             legacy = cfg.get("workload")
             if isinstance(legacy, dict) and legacy.get("type", "http").lower() in (
-                "http", "openai", "openai-chat", "llm", "llm-chat"
+                "http", "openai", "openai-chat", "llm", "llm-chat",
+                "openai-completions", "completions", "openai-text", "text-completions",
             ):
                 wt_spec = legacy
                 cfg = {**cfg, "workload": None}
@@ -472,6 +476,15 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
         if wl_hook is not None and wl_hook not in post_hooks:
             post_hooks = list(post_hooks) + [wl_hook]
 
+    endpoints = normalize_endpoints(cfg.get("endpoints"))
+    group_by = [str(k) for k in (cfg.get("group_by") or [])]
+    if endpoints and "model" not in group_by:
+        # Per-model summaries next to the arm aggregate (issue #8).
+        group_by.append("model")
+    _check_workloads(workload_type, endpoints,
+                     [(workload, None)] + [(ln.workload, ln.model) for ln in lanes]
+                     + [(pl.workload, pl.model) for ph in phases for pl in ph.lanes])
+
     recorder = _build_recorder(cfg.get("record"))
 
     stall_ms = cfg.get("stall_ms", cfg.get("stall_threshold_ms"))
@@ -491,7 +504,7 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
         stop_on_exhausted=bool(cfg.get("stop_on_exhausted", True)),
         stall_ms=None if stall_ms in (None, "none", "off", False) else float(stall_ms),
         dump_series=bool(cfg.get("dump_series", False)),
-        group_by=[str(k) for k in (cfg.get("group_by") or [])],
+        group_by=group_by,
         warmup_requests=int(cfg.get("warmup_requests", 0)),
         warmup_s=float(_opt_duration(cfg.get("warmup_s", cfg.get("warmup", 0.0)))),
         phases=phases,
@@ -499,7 +512,30 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
         void_rules=parse_void_rules(cfg.get("void_rules")),
         model_revision=(str(cfg["model_revision"]) if cfg.get("model_revision") else None),
         record_env=[str(k) for k in (cfg.get("record_env") or [])],
+        endpoints=endpoints,
     )
+
+
+def _check_workloads(workload_type: WorkloadType, endpoints: dict,
+                     pairs: list[tuple[Workload, Optional[str]]]) -> None:
+    """Cross-checks that need both sides (issue #11): token-id replay needs a
+    completions workload-type, and ``namespace: model`` resolves to the model
+    the lane (or workload-type) targets."""
+    for wl, lane_model in pairs:
+        if wl is None:
+            continue
+        if getattr(wl, "send", None) == "token_ids" and isinstance(workload_type, OpenAIChatWorkloadType):
+            raise ValueError(
+                "workload send: token_ids sends `prompt: [token ids]`, which "
+                "/v1/chat/completions does not accept; use workload_type "
+                "{type: openai-completions, url: .../v1/completions}")
+        if getattr(wl, "namespace", None) == "model":
+            model = lane_model or getattr(workload_type, "model", None)
+            if not model:
+                raise ValueError("namespace: model needs a lane `model` or workload_type `model`")
+            wl.set_namespace(model)
+        if endpoints and lane_model and lane_model not in endpoints:
+            raise ValueError(f"lane model {lane_model!r} has no endpoint (have: {sorted(endpoints)})")
 
 
 def _opt_duration(v) -> Optional[float]:

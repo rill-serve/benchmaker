@@ -63,14 +63,18 @@ A benchmark in benchmaker is the composition of four things:
     ITL percentiles and stall accounting, `group_by: [cache_class]`, the TTFT
     mix/latency decomposition, and what each arm's TTFT was stamped on.
 18. [Capability, manifest, void runs](capability-manifest.md) — server
-    self-description before/after a run, `manifest.json`, and `void_rules`.
+    self-description before/after a run (per endpoint with `endpoints:`),
+    `manifest.json`, and `void_rules`.
 19. [Phases, warm-up, capacity-revisit](phases-capacity.md) — timed stages
     with their own lanes, excluded warm-up, and the warm/revisit workload
     for measuring a working set larger than the device cache.
 20. [Multi-arm comparisons](arms.md) — `benchmaker arms` / `compare`: ABBA
-    interleaving, per-rep bundles, same-job enforcement, the comparison table.
+    interleaving, per-rep bundles, same-job enforcement, the comparison table,
+    start/stop/`ready_check`/`post_stop_check` lifecycle, several servers per
+    arm.
 21. [Replaying published traces](trace-replay.md) — Mooncake (block-hash
-    prefix structure) and Azure LLM inference traces with real arrival times.
+    prefix structure; `send: token_ids` bypasses the tokenizer) and Azure
+    LLM inference traces with real arrival times.
 22. [Session replay](session-replay.md) — prepared multi-turn session files: per-session turn
     dependencies, prompt-set hash, recorded-output pinning, chat-template check.
 

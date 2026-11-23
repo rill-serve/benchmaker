@@ -9,6 +9,11 @@ Two sizers turn "N tokens of deterministic filler for seed S" into text:
   ``block`` produces text that is *distinct per seed* while still encoding to
   exactly N tokens (used for cache-block replay where different block ids must
   not collide).
+* :class:`TokenIdSampler` — no text at all: a seeded block of exactly N token
+  *ids* drawn from a whitelist, sent as ``prompt: [ids]`` to
+  ``/v1/completions`` (issue #11). The server's tokenizer never runs, so
+  nothing merges across block boundaries and no chat template shifts the
+  alignment: equal seeds give byte-identical, page-aligned prefixes.
 
 All text is a pure function of ``(seed, n)`` via a *stable* hash — never
 Python's salted ``hash()`` — so two processes replaying the same trace send
@@ -21,11 +26,12 @@ from __future__ import annotations
 import hashlib
 import io
 import random
-from typing import Any, Optional
+from collections import OrderedDict
+from typing import Any, Sequence
 
 __all__ = [
-    "CharSizer", "TokenizerSizer", "build_sizer", "filler_text", "stable_hash",
-    "FILLER_WORDS",
+    "CharSizer", "TokenizerSizer", "TokenIdSampler", "build_sizer", "load_tokenizer",
+    "filler_text", "stable_hash", "FILLER_WORDS",
 ]
 
 # Filler vocabulary (shared with TraceLab replay). Joined with spaces it looks
@@ -47,9 +53,24 @@ def stable_hash(seed: Any) -> int:
     return int.from_bytes(h[:8], "big") & ((1 << 63) - 1)
 
 
-def build_sizer(tokenizer_id: Optional[str], chars_per_token: float):
-    if tokenizer_id:
-        return TokenizerSizer(tokenizer_id)
+def load_tokenizer(tokenizer: Any):
+    """A HF tokenizer id -> the tokenizer; anything else is returned as-is, so
+    the Python API (and tests) can pass an already-loaded tokenizer."""
+    if isinstance(tokenizer, str):
+        try:
+            from transformers import AutoTokenizer  # type: ignore
+        except ImportError as e:  # pragma: no cover - exercised via message
+            raise ImportError(
+ "tokenizer=... needs the `transformers` package. "
+                "Install with `pip install -e .[tokenizer]`."
+            ) from e
+        return AutoTokenizer.from_pretrained(tokenizer)
+    return tokenizer
+
+
+def build_sizer(tokenizer: Any, chars_per_token: float):
+    if tokenizer:
+        return TokenizerSizer(tokenizer)
     return CharSizer(chars_per_token)
 
 
@@ -78,15 +99,8 @@ class TokenizerSizer:
 
     exact = True
 
-    def __init__(self, tokenizer_id: str):
-        try:
-            from transformers import AutoTokenizer  # type: ignore
-        except ImportError as e:  # pragma: no cover - exercised via message
-            raise ImportError(
-                "tokenizer=... needs the `transformers` package. "
-                "Install with `pip install -e .[tokenizer]`."
-            ) from e
-        self._tok = AutoTokenizer.from_pretrained(tokenizer_id)
+    def __init__(self, tokenizer: Any):
+        self._tok = load_tokenizer(tokenizer)
         self._unit = self._single_token_unit()
         self._blocks: dict[tuple[int, int], str] = {}
         self._word_cost: dict[str, int] = {}
@@ -156,6 +170,79 @@ class TokenizerSizer:
             ids = self._encode(text)
         self._blocks[key] = text
         return text
+
+
+class TokenIdSampler:
+    """Seeded blocks of exactly ``n`` token ids from a whitelist (issue #11).
+
+    Used by ``send: token_ids`` trace replay: every hash block is a list of
+    ints, so the server's tokenizer never touches it — no cross-block merges,
+    no chat-template prefix — and ``block(seed, r)`` is exactly the first
+    ``r`` ids of ``block(seed, 512)``, which keeps a truncated last block a
+    true prefix of the full one.
+
+    The whitelist excludes ids a server treats specially (BOS/EOS/PAD, chat
+    control tokens such as ``<|im_start|>``, reserved ranges): those can end
+    generation early or trip a parser even when they appear in a prompt.
+    With a tokenizer they are found from ``all_special_ids`` plus every
+    *added* token; without one (``from_vocab``) the caller states the reserved
+    ids explicitly.
+
+    Blocks are memoized per ``(seed, n)`` in a bounded LRU: rendering is
+    cheap, but not free at thousands of requests per second, and a full
+    Mooncake trace has far too many distinct blocks to keep them all.
+    """
+
+    def __init__(self, whitelist: Sequence[int], *, source: str = "", cache_size: int = 4096):
+        ids = sorted({int(i) for i in whitelist})
+        if not ids:
+            raise ValueError("token-id whitelist is empty")
+        self._ids = ids
+        self.source = source
+        self._cache: OrderedDict[tuple[int, int], list[int]] = OrderedDict()
+        self._cache_size = max(1, int(cache_size))
+
+    @classmethod
+    def from_tokenizer(cls, tok: Any, **kw: Any) -> "TokenIdSampler":
+        tok = load_tokenizer(tok)
+        n = len(tok)
+        special = set(int(i) for i in getattr(tok, "all_special_ids", ()) or ())
+        special |= {int(i) for i in (getattr(tok, "added_tokens_encoder", None) or {}).values()}
+        return cls([i for i in range(n) if i not in special],
+                   source=f"tokenizer vocab={n} excluded={len(special)}", **kw)
+
+    @classmethod
+    def from_vocab(cls, vocab_size: int, exclude_ids: Sequence[int] = (),
+                   exclude_last: int = 0, **kw: Any) -> "TokenIdSampler":
+        """``[0, vocab_size)`` minus ``exclude_ids`` minus the last ``exclude_last``
+        ids — the escape hatch when the tokenizer is not available locally."""
+        vocab_size = int(vocab_size)
+        if vocab_size <= 0:
+            raise ValueError("vocab_size must be > 0")
+        excluded = {int(i) for i in exclude_ids} | set(range(max(0, vocab_size - int(exclude_last)), vocab_size))
+        return cls([i for i in range(vocab_size) if i not in excluded],
+                   source=f"vocab={vocab_size} excluded={len(excluded)}", **kw)
+
+    @property
+    def size(self) -> int:
+        """Number of whitelisted ids."""
+        return len(self._ids)
+
+    def block(self, seed: Any, n_tokens: int) -> list[int]:
+        n = max(1, int(n_tokens))
+        key = (stable_hash(seed), n)
+        hit = self._cache.get(key)
+        if hit is not None:
+            self._cache.move_to_end(key)
+            return list(hit)
+        rng = random.Random(key[0])
+        ids = self._ids
+        m = len(ids)
+        out = [ids[rng.randrange(m)] for _ in range(n)]
+        self._cache[key] = out
+        while len(self._cache) > self._cache_size:
+            self._cache.popitem(last=False)
+        return list(out)
 
 
 def filler_text(seed: Any, char_count: int) -> str:
