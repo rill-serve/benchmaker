@@ -99,6 +99,9 @@ repeatedly on the CLI; pass `labels={...}` from Python.
         "tokens_per_s": { ... }
     },
 
+    # Optional blocks, each present only when the config asked for it:
+    "groups":  {"cache_class": {"device_hit": {...}, "restore": {...}, "miss": {...}}},  # group_by (#2)
+
     # Per-monitor time-series summaries (when configured):
     "monitors": {
         "vllm": {
@@ -130,13 +133,15 @@ One JSON object per line:
   "bytes_recv": 1024,
   "error": null,
   "workload": "openai-chat",
-  "meta": {"prompt_messages": [...], "max_tokens": 128, "finish_reason": "stop"},
+  "meta": {"prompt_messages": [...], "max_tokens": 128, "finish_reason": "stop",
+           "cache_class": "device_hit"},
   "extra": {"ttft_s": 0.17, "itl_ms_mean": 25.3, "tokens_out": 64.0, "tokens_per_s": 32.1, "cached_tokens": 128.0},
   "series": {"itl_ms": [25.1, 25.0, 24.9, 180.2, ...]}
 }
 ```
 
-`series` is only written with `dump_series: true`.
+`meta.cache_class` comes from the OpenAI workload-type's classifier. `series`
+is only written with `dump_series: true`.
 
 ### `monitors.jsonl`
 

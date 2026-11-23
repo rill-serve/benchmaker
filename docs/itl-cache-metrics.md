@@ -1,9 +1,11 @@
-# Decode stalls and pooled ITL
+# Decode stalls and cache classes
 
-Issue #1: a mean ITL hides the stalls that make decode *feel* slow.
-This page covers what benchmaker records about them:
+Issues #1 and #2: a mean ITL hides the stalls that make decode *feel*
+slow, and an aggregate TTFT hides which cache class paid for it. This page
+covers the two mechanisms benchmaker adds for that:
 
-1. **Pooled ITL and stall accounting** (`itl_ms_pooled`, `stalls`).
+1. **Pooled ITL and stall accounting** (`itl_ms_pooled`, `stalls`) — issue #1.
+2. **Cache classes and `group_by`** — per-class TTFT — issue #2.
 
 All of it is derived from the same `samples.jsonl` and `summary.json` that
 every run bundle already writes; nothing here needs a special server.
@@ -76,3 +78,60 @@ dump_series: true     # write every sample's raw series into samples.jsonl (larg
 With `dump_series: true` each `samples.jsonl` record carries
 `"series": {"itl_ms": [...], "ttft_ms": [...]}`, which is what you want when
 plotting a timeline or recomputing stalls offline at a different threshold.
+
+## 2. Cache classes and `group_by` (#2)
+
+### The problem
+
+"Mean TTFT improved by 40 ms" is ambiguous: did the server get faster, or did
+it simply get a better hit mix? A run where 70 % of prompts are full device
+hits has a great mean TTFT and tells you nothing about the restore path.
+
+### Tagging
+
+`OpenAIChatWorkloadType` classifies every streamed response from the `usage`
+block the server returns (`prompt_tokens`, `cached_tokens`) into
+`sample.meta["cache_class"]`:
+
+| Class         | Meaning                                                        |
+| ------------- | -------------------------------------------------------------- |
+| `device_hit`  | the whole cached prefix was served from the device (KV) cache  |
+| `restore`     | a prefix was cached but had to be restored from a host/remote tier |
+| `partial`     | only part of the prefix was cached                              |
+| `miss`        | nothing cached (cold prefill)                                   |
+
+Which combination of `cached_tokens`/`prompt_tokens` means `device_hit` vs
+`restore` is server-specific. The default classifier uses a token-rate
+threshold (`CacheClassInfo` → `classify_cache`); pass your own for your
+server:
+
+```yaml
+workload_type:
+  type: openai
+  cache_classifier: my_pkg.classify:rill_cache_class   # fn(CacheClassInfo) -> str | None
+```
+
+A classifier returning `None` leaves the sample untagged.
+
+### Breaking the summary down
+
+```yaml
+group_by: [cache_class]
+```
+
+adds, to the top level **and** to every lane block of `summary.json`:
+
+```python
+"groups": {
+    "cache_class": {
+        "device_hit": {"share": 0.71, "wall_time_s": 60.0, "workload_metrics": {"ttft_s": {...}, ...},
+                        "stalls": {...}, "latency_s": {...}, "throughput_rps": ...},
+        "restore":   {"share": 0.18, ...},
+        "miss":      {"share": 0.11, ...}
+    }
+}
+```
+
+`group_by` accepts any `Sample.meta` key (`lane`, a dataset column, any tag a
+workload puts on its items, …).
+

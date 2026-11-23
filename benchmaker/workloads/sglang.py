@@ -15,8 +15,9 @@ Item interpretation:
                 ``Request.meta`` instead of sent.
 
 Captured metrics: ttft_s, itl_ms_mean/p50/p99, tokens_out, prompt_tokens,
-cached_tokens, tokens_per_s, meta.finish_reason, and the raw per-token gap
-series ``itl_ms`` pooled by the summary (#1).
+cached_tokens, cached_ratio, tokens_per_s, meta.finish_reason,
+meta.cache_class (device_hit/restore/partial/miss from ``meta_info``), and
+the raw per-token gap series ``itl_ms`` pooled by the summary (#1).
 """
 
 from __future__ import annotations
@@ -24,14 +25,14 @@ from __future__ import annotations
 import json
 import os
 import statistics
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from benchmaker.env import load_dotenv
 from benchmaker.core.metrics import ITL_SERIES
 from benchmaker.core.types import Request, Response, Sample
 from benchmaker.workloads._sse import reassemble_sse_lines
 from benchmaker.workloads.base import WorkloadType
-from benchmaker.workloads.llm import _pct
+from benchmaker.workloads.llm import CacheClassInfo, _cache_source_of, _pct, classify_cache
 
 
 _ENV_BASE_URL_KEYS = ("SGLANG_API_BASE_URL", "SGLANG_BASE_URL")
@@ -60,9 +61,15 @@ class SGLangGenerateWorkloadType(WorkloadType):
         timeout_s: Optional[float] = 600.0,
         name: str = "sglang-generate",
         passthrough_meta: bool = False,
+        cache_classifier: Optional[Callable[["CacheClassInfo"], Optional[str]]] = None,
+        cache_full_hit_ratio: float = 0.9,
         **sampling: Any,
     ):
+        if not 0.0 < cache_full_hit_ratio <= 1.0:
+            raise ValueError(f"cache_full_hit_ratio must be in (0, 1], got {cache_full_hit_ratio!r}")
         self.name = name
+        self._cache_classifier = cache_classifier
+        self._cache_full_hit_ratio = float(cache_full_hit_ratio)
         self._url = url
         self._max_tokens = max_tokens
         self._temperature = temperature
@@ -162,6 +169,7 @@ class SGLangGenerateWorkloadType(WorkloadType):
         prompt_tokens: Optional[int] = None
         cached_tokens: Optional[int] = None
         finish_reason: Any = None
+        mi_raw: dict = {}
 
         # Reassemble across chunk boundaries: httpx2's aiter_raw() yields
         # bytes at arbitrary offsets, so a `meta_info` event can be split
@@ -187,6 +195,7 @@ class SGLangGenerateWorkloadType(WorkloadType):
                 last_text = text
             mi = obj.get("meta_info")
             if isinstance(mi, dict):
+                mi_raw = dict(mi)
                 if mi.get("completion_tokens") is not None:
                     completion_tokens = int(mi["completion_tokens"])
                 if mi.get("prompt_tokens") is not None:
@@ -213,6 +222,15 @@ class SGLangGenerateWorkloadType(WorkloadType):
             sample.extra["prompt_tokens"] = float(prompt_tokens)
         if cached_tokens is not None:
             sample.extra["cached_tokens"] = float(cached_tokens)
+            if prompt_tokens:
+                sample.extra["cached_ratio"] = float(cached_tokens) / float(prompt_tokens)
+        if response.ok and prompt_tokens is not None:
+            info = CacheClassInfo(prompt_tokens=prompt_tokens, cached_tokens=cached_tokens or 0,
+                                  hint=_cache_source_of(mi_raw))
+            cache_class = (self._cache_classifier(info) if self._cache_classifier
+                           else classify_cache(info, self._cache_full_hit_ratio))
+            if cache_class is not None:
+                sample.meta["cache_class"] = cache_class
         if out_tokens > 0 and ttft is not None and response.elapsed_s > ttft:
             sample.extra["tokens_per_s"] = out_tokens / (response.elapsed_s - ttft)
         elif out_tokens > 0 and response.elapsed_s > 0:

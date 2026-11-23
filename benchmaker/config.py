@@ -459,6 +459,7 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
         stop_on_exhausted=bool(cfg.get("stop_on_exhausted", True)),
         stall_ms=None if stall_ms in (None, "none", "off", False) else float(stall_ms),
         dump_series=bool(cfg.get("dump_series", False)),
+        group_by=[str(k) for k in (cfg.get("group_by") or [])],
     )
 
 def _build_lanes(spec: Any, *, duration_s: Optional[float],

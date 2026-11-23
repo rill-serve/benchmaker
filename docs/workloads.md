@@ -117,7 +117,7 @@ StaticWorkload(items=[
 - `reasoning_tokens` — from `usage.completion_tokens_details` when present
 - `content_tokens`   — `completion_tokens - reasoning_tokens` when both known
 - `prompt_tokens` — when present in `usage`
-- `tokens_per_s`  — `tokens_out / (latency - ttft)`
+- `cached_tokens`, `cached_ratio` — prefix-cache hits from `usage` (`cached_ratio = cached / prompt`)
 
 `ttft_token` (`"any"` | `"content"`, default `"any"`) selects which token the
 headline `ttft_s` is measured to: the first token of any kind (reasoning *or*
@@ -133,6 +133,17 @@ tokens received"`).
 **`prompt_tokens`** from the OpenAI `usage` block is captured when present;
 **`cached_tokens`** is also captured when the server returns it (vLLM's prefix
 cache hit count).
+
+**Cache class.** Each response is classified into `meta.cache_class` —
+`device_hit` (the cached prefix covers ≥ `full_hit_ratio` of the prompt and
+no restore was involved), `restore` (the server reported a restored/remote
+prefix), `partial` (some tokens cached, below the ratio) or `miss` — from
+`cached_tokens`, `restored_tokens`/`cache_hint`-style usage fields and
+response headers. Pass `cache_classifier: 'module:fn'` to override it for
+your server (the function receives a `CacheClassInfo` and returns a class
+name or `None`). With `group_by: [cache_class]` the summary is then broken
+down per class; see
+[Decode stalls and cache classes](itl-cache-metrics.md).
 
 ### `DeepRAGWorkload`
 

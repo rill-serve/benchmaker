@@ -59,8 +59,9 @@ A benchmark in benchmaker is the composition of four things:
 16. [AgentX](agentx.md) — the SemiAnalysis agentic-coding inference benchmark:
     WEKA trace replay with block-hash synthetic prompts, subagent DAGs, seeded
     warmup, and a profiling window.
-17. [Decode stalls and pooled ITL](itl-cache-metrics.md) — token-level ITL
-    percentiles pooled across requests and decode-stall accounting.
+17. [Decode stalls and cache classes](itl-cache-metrics.md) — token-level ITL
+    percentiles pooled across requests, decode-stall accounting, and
+    `group_by: [cache_class]` per-class summaries.
 
 ## Where things live
 

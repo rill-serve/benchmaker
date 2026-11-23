@@ -161,8 +161,8 @@ Full docs live in [`docs/`](docs/):
 - [TraceLab benchmark](docs/tracelab.md) — replay real coding-agent (Claude/Codex) token + prefix-cache distributions
 - [SGLang benchmark](docs/sglang.md) — native SGLang `/generate` benchmark
 - [Agentic](docs/agentic.md) — multi-turn prefix-cache parity replay
-- [Decode stalls and pooled ITL](docs/itl-cache-metrics.md) — pooled ITL
-  percentiles and decode-stall accounting
+- [Decode stalls and cache classes](docs/itl-cache-metrics.md) — pooled ITL
+  percentiles, stall accounting and per-cache-class summaries
 
 ## Deterministic replay (`swebench-replay`)
 

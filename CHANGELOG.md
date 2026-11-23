@@ -9,7 +9,13 @@
   accounted in `workload_metrics.stalls` (per-request stall counts and time,
   stall-length percentiles, `total_time_ms`, `excess_ms`, a log2 histogram).
   `dump_series: true` writes each sample's `series` into `samples.jsonl`.
-- Docs: `itl-cache-metrics.md`; `cli-and-yaml.md`, `metrics.md` updated.
+- **Cache classes and TTFT decomposition (#2):** `OpenAIChatWorkloadType`
+  tags every response with `meta.cache_class` (`device_hit` / `restore` /
+  `partial` / `miss`, from `usage` + headers; override with
+  `cache_classifier:`), the new `group_by: [meta key, ...]` config key breaks
+  the summary — and every lane/phase block — down by any `Sample.meta` key,
+  down by any `Sample.meta` key.
+- Docs: `itl-cache-metrics.md`; `cli-and-yaml.md`, `metrics.md`, `workloads.md` updated.
 - Added the `agentx` recipe and workload (`benchmaker agentx`, YAML `type:
   agentx`): the SemiAnalysis AgentX v1.0 agentic-coding benchmark
   (https://inferencex.semianalysis.com/agentx). Replays the public WEKA-format

@@ -17,6 +17,9 @@ from benchmaker.core.types import Sample
 ITL_SERIES = "itl_ms"
 DEFAULT_STALL_MS = 12.0
 
+# Bucket label used for samples that lack a value for a ``group_by`` key.
+UNGROUPED = "(none)"
+
 # Upper edges (ms) of the log2 gap histogram. The last bin is open-ended.
 _HISTOGRAM_EDGES_MS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192)
 
@@ -51,8 +54,10 @@ class MetricsAggregator:
     """Accumulates samples and produces a summary.
 
     ``stall_ms`` is the inter-token gap above which a decode step counts as a
-    stall (issue #1). ``None`` disables the ``stalls`` block. ``dump_series``
-    writes each sample's raw ``series`` (per-token gaps) into samples.jsonl.
+    stall (issue #1). ``None`` disables the ``stalls`` block. ``group_by`` lists
+    ``Sample.meta`` keys to break the summary down by (e.g. ``["cache_class"]``
+    for per-cache-class TTFT, issue #2). ``dump_series`` writes each sample's
+    raw ``series`` (per-token gaps) into samples.jsonl.
     """
 
     samples: list[Sample] = field(default_factory=list)
@@ -64,6 +69,7 @@ class MetricsAggregator:
     # name -> list of (elapsed_s, {metric_name: value})
     monitor_samples: dict[str, list[tuple[float, dict[str, float]]]] = field(default_factory=dict)
     stall_ms: Optional[float] = DEFAULT_STALL_MS
+    group_by: list[str] = field(default_factory=list)
     dump_series: bool = False
 
     def add(self, sample: Sample) -> None:
@@ -84,22 +90,15 @@ class MetricsAggregator:
         end = self.end_time or time.monotonic()
         wall_s = max(end - self.start_time, 1e-9)
 
-        out = _summary_for_samples(self.samples, wall_s, stall_ms=self.stall_ms)
+        samples = self.samples
+        out = _summary_for_samples(samples, wall_s, stall_ms=self.stall_ms)
 
         # A mixed benchmark needs each lane's SLO signal independently.  Use
         # the same wall-clock interval as the aggregate so lane throughput is
         # directly comparable to the total, while latency and workload metrics
         # remain scoped to that lane's samples.
-        lanes: dict[str, list[Sample]] = defaultdict(list)
-        for sample in self.samples:
-            lane = sample.meta.get("lane")
-            if isinstance(lane, str) and lane:
-                lanes[lane].append(sample)
-        if lanes:
-            out["lanes"] = {
-                name: _summary_for_samples(samples, wall_s, stall_ms=self.stall_ms)
-                for name, samples in sorted(lanes.items())
-            }
+        out["lanes"] = _grouped(samples, "lane", wall_s, self.stall_ms)
+        _apply_group_by(out, samples, wall_s, self.group_by, self.stall_ms)
 
         # Monitor time-series: summarize each metric per monitor.
         if self.monitor_samples:
@@ -174,6 +173,7 @@ class MetricsAggregator:
                 for kk in ("mean", "p50", "p90", "p99", "max"):
                     lines.append(f"      {kk:<6}: {v[kk]:.4f}")
         lines.extend(_render_itl(s))
+        lines.extend(_render_groups(s))
         if s.get("lanes"):
             lines.append("")
             lines.append("  lanes")
@@ -325,6 +325,43 @@ def _summary_for_samples(samples: list[Sample], wall_s: float,
     return out
 
 
+def _apply_group_by(out: dict, samples: list[Sample], wall_s: float,
+                    group_by: list[str], stall_ms: Optional[float]) -> None:
+    """Break ``out`` down by arbitrary meta keys (e.g. cache_class) (#2)."""
+    for key in group_by:
+        grouped = _grouped(samples, key, wall_s, stall_ms)
+        if grouped:
+            out.setdefault("groups", {})[key] = grouped
+
+
+def _grouped(samples: list[Sample], key: str, wall_s: float,
+             stall_ms: Optional[float]) -> dict:
+    """Bucket samples by ``meta[key]`` and summarize each bucket.
+
+    Each bucket gets a ``share`` (fraction of requests) next to its own summary,
+    so a per-class latency table and the class mix live side by side (#2).
+    """
+    buckets: dict[Any, list[Sample]] = defaultdict(list)
+    for s in samples:
+        buckets[_group_value(s, key)].append(s)
+    if not buckets:
+        return {}
+    total = len(samples)
+    out: dict[str, dict] = {}
+    for value, bucket in buckets.items():
+        sub = _summary_for_samples(bucket, wall_s, stall_ms=stall_ms)
+        sub["share"] = len(bucket) / total if total else 0.0
+        out[str(value)] = sub
+    return dict(sorted(out.items()))
+
+
+def _group_value(sample: Sample, key: str) -> Any:
+    v = sample.meta.get(key)
+    if v is None or v == "":
+        return UNGROUPED
+    return v
+
+
 # --------------------------------------------------------------------------- #
 # Pooled series + decode stalls (issue #1)                                     #
 # --------------------------------------------------------------------------- #
@@ -439,6 +476,25 @@ def _render_itl(s: dict) -> list[str]:
             lines.append(
                 f"    [{b['lo_ms']:>5g}, {hi:>5}) ms : {b['count']:>8}  "
                 f"({b['share'] * 100:5.1f}%)"
+            )
+    return lines
+
+
+def _render_groups(s: dict) -> list[str]:
+    lines: list[str] = []
+    for key, groups in (s.get("groups") or {}).items():
+        lines.append("")
+        lines.append(f"  by {key}")
+        header = f"    {'value':<14} {'share':>6} {'n':>6}  ttft p50/p90/p99"
+        lines.append(header)
+        for value, g in groups.items():
+            ttft = (g.get("workload_metrics") or {}).get("ttft_s")
+            if ttft:
+                tt = f"{ttft['p50']:.3f} / {ttft['p90']:.3f} / {ttft['p99']:.3f}"
+            else:
+                tt = "-"
+            lines.append(
+                f"    {value:<14} {g['share'] * 100:5.1f}% {g['total_requests']:>6}  {tt}"
             )
     return lines
 

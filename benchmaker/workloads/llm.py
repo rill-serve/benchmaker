@@ -19,7 +19,12 @@ Captured metrics (on top of base latency/throughput):
     content_tokens      completion_tokens - reasoning_tokens, when both known
     prompt_tokens       from usage block when available
     tokens_per_s        completion_tokens / generation_time
+    cached_ratio       cached_tokens / prompt_tokens (when both known)
 
+classification / provenance kept in `Sample.meta` (not aggregated):
+    cache_class         "device_hit" | "restore" | "partial" | "miss", from
+                        usage + cache-source hints (see `classify_cache`)
+    cache_hint          raw cache-source hint the server gave (if any)
 
 Raw per-token inter-token gaps (ms) are kept on every sample as
 ``sample.series["itl_ms"]`` and pooled across requests by the summary
@@ -45,7 +50,7 @@ import json
 import logging
 import os
 import statistics
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 from benchmaker.env import load_dotenv
 from benchmaker.core.metrics import ITL_SERIES
@@ -102,6 +107,8 @@ class OpenAIChatWorkloadType(WorkloadType):
         name: str = "openai-chat",
         passthrough_meta: bool = False,
         ttft_token: str = "any",
+        cache_classifier: Optional[Callable[["CacheClassInfo"], Optional[str]]] = None,
+        cache_full_hit_ratio: float = 0.9,
         **sampling: Any,
     ):
         """Any extra keyword argument (e.g. ``min_tokens``, ``ignore_eos``,
@@ -113,6 +120,12 @@ class OpenAIChatWorkloadType(WorkloadType):
         which token the headline ``ttft_s`` is measured to — the first token
         of any kind, or the first visible content token. See the module
         docstring for the reasoning-model rationale.
+
+        ``cache_classifier`` (issue #2) overrides :func:`classify_cache`; it
+        receives a :class:`CacheClassInfo` and returns ``"device_hit"``,
+        ``"restore"``, ``"partial"``, ``"miss"`` or ``None`` (unclassified).
+        ``cache_full_hit_ratio`` is the cached/prompt ratio at which a hit
+        counts as full (``device_hit``); a hit below it is ``partial``.
         """
         if ttft_token not in ("any", "content"):
             raise ValueError(
@@ -121,7 +134,11 @@ class OpenAIChatWorkloadType(WorkloadType):
                 "produces (reasoning or content); 'content' measures time to "
                 "the first visible (non-reasoning) token."
             )
+        if not 0.0 < cache_full_hit_ratio <= 1.0:
+            raise ValueError(f"cache_full_hit_ratio must be in (0, 1], got {cache_full_hit_ratio!r}")
         self._ttft_token = ttft_token
+        self._cache_classifier = cache_classifier
+        self._cache_full_hit_ratio = float(cache_full_hit_ratio)
         self.name = name
         self._url = url
         self._model = model
@@ -285,8 +302,11 @@ class OpenAIChatWorkloadType(WorkloadType):
         reasoning_tokens: Optional[int] = None
         prompt_tokens: Optional[int] = None
         cached_tokens: Optional[int] = None
+        restored_tokens: Optional[int] = None
+        cache_hint: Optional[str] = None
         finish_reason: Optional[str] = None
         usage_seen = False
+        usage_raw: dict = {}
 
         # Reassemble across chunk boundaries first: httpx2's aiter_raw()
         # yields bytes at arbitrary offsets, so the final `usage` event is
@@ -309,6 +329,7 @@ class OpenAIChatWorkloadType(WorkloadType):
             if obj.get("usage"):
                 usage_seen = True
                 u = obj["usage"]
+                usage_raw = dict(u) if isinstance(u, dict) else {}
                 if u.get("completion_tokens") is not None:
                     usage_completion_tokens = int(u["completion_tokens"])
                 if u.get("prompt_tokens") is not None:
@@ -318,6 +339,17 @@ class OpenAIChatWorkloadType(WorkloadType):
                     cached_tokens = int(details["cached_tokens"])
                 elif u.get("cached_tokens") is not None:
                     cached_tokens = int(u["cached_tokens"])
+                # Which tier served the cached prefix (device / host / remote),
+                # when the server says so: usage, prompt_tokens_details or
+                # response headers (issue #2). Also restored-from-host counts.
+                for src in (u, details if isinstance(details, dict) else None):
+                    if isinstance(src, dict):
+                        if restored_tokens is None and src.get("restored_tokens") is not None:
+                            restored_tokens = int(src["restored_tokens"])
+                        if cache_hint is None:
+                            cache_hint = _cache_source_of(src)
+                if cache_hint is None:
+                    cache_hint = _cache_source_of(dict(response.headers or {}))
                 # Thinking models report generated reasoning tokens separately
                 # from visible content; surfacing the breakdown keeps tokens_out
                 # honest and exposes the reasoning share (#14).
@@ -395,6 +427,27 @@ class OpenAIChatWorkloadType(WorkloadType):
             sample.extra["prompt_tokens"] = float(prompt_tokens)
         if cached_tokens is not None:
             sample.extra["cached_tokens"] = float(cached_tokens)
+        if cached_tokens is not None and prompt_tokens:
+            sample.extra["cached_ratio"] = float(cached_tokens) / float(prompt_tokens)
+        # Cache class (issue #2): device_hit / restore / partial / miss. Only
+        # classifiable when the server reported a usage block.
+        if response.ok and prompt_tokens is not None:
+            info = CacheClassInfo(
+                prompt_tokens=prompt_tokens,
+                cached_tokens=cached_tokens or 0,
+                restored_tokens=restored_tokens,
+                hint=cache_hint,
+                usage=_usage_cache_fields(usage_raw),
+                headers=dict(response.headers or {}),
+            )
+            cache_class = (
+                self._cache_classifier(info) if self._cache_classifier
+                else classify_cache(info, self._cache_full_hit_ratio)
+            )
+            if cache_class is not None:
+                sample.meta["cache_class"] = cache_class
+            if cache_hint is not None:
+                sample.meta["cache_hint"] = cache_hint
         # Dataset workloads can provide a pre-run prompt-size estimate and a
         # RAG packing depth through Request.meta. Preserve them as numeric
         # metrics even when an endpoint omits usage information.
@@ -416,7 +469,100 @@ class OpenAIChatWorkloadType(WorkloadType):
 
         return sample
 
+# --------------------------------------------------------------------------- #
+# Cache classification (issue #2)                                             #
+# --------------------------------------------------------------------------- #
+
+CACHE_CLASSES = ("device_hit", "restore", "partial", "miss")
+
+# Keys (usage block, prompt_tokens_details, response headers) a server may use
+# to say which tier served the cached prefix. Checked case-insensitively for
+# headers; the first non-empty value wins.
+_CACHE_SOURCE_KEYS = ("cache_source", "cache_tier", "kv_cache_source", "kv_cache_tier",
+                      "prefix_cache_source", "cached_tokens_source", "cache_hit_tier")
+
+
+class CacheClassInfo:
+    """What the response said about the prefix cache, for :func:`classify_cache`."""
+
+    def __init__(self, prompt_tokens: int, cached_tokens: int = 0,
+                 restored_tokens: Optional[int] = None, hint: Optional[str] = None,
+                 usage: Optional[dict] = None, headers: Optional[dict] = None):
+        self.prompt_tokens = int(prompt_tokens)
+        self.cached_tokens = int(cached_tokens)
+        self.restored_tokens = restored_tokens
+        self.hint = hint
+        self.usage = dict(usage or {})
+        self.headers = dict(headers or {})
+
+    @property
+    def cached_ratio(self) -> float:
+        return self.cached_tokens / self.prompt_tokens if self.prompt_tokens else 0.0
+
+
+def _cache_source_of(src: dict) -> Optional[str]:
+    if not isinstance(src, dict):
+        return None
+    # usage fields are verbatim; HTTP headers may be prefixed (X-Cache-Source)
+    # and use either separator.
+    lowered = {str(k).lower().replace("-", "_"): v for k, v in src.items()}
+    for key in _CACHE_SOURCE_KEYS:
+        v = lowered.get(key)
+        if v in (None, "", 0, False):
+            for k, hv in lowered.items():
+                if k.endswith("_" + key) and hv not in (None, "", 0, False):
+                    v = hv
+                    break
+        if v not in (None, "", 0, False):
+            return str(v)
+    return None
+
+
+def _usage_cache_fields(raw: dict) -> dict:
+    return {k: v for k, v in raw.items() if "cache" in k.lower() or "restored" in k.lower()}
+
+
+def classify_cache(info: CacheClassInfo, full_hit_ratio: float = 0.9) -> Optional[str]:
+    """Map a response's cache information to one of :data:`CACHE_CLASSES`.
+
+    * ``miss``     — nothing was cached.
+    * ``restore``  — the server said the cached prefix was (partly) restored
+                     from a remote/host tier: a ``cache_hint`` naming a
+                     restore/remote/host tier, or ``restored_tokens > 0``.
+    * ``device_hit`` — cached tokens cover at least ``full_hit_ratio`` of the
+                     prompt and no restore was involved: the prefix cache
+                     did its whole job from the device.
+    * ``partial``  — some tokens cached, below the full-hit ratio.
+
+    The ratio is a heuristic: a hit that stops short of the prompt is usually
+    the genuinely new suffix (the new turn), which is why it is configurable.
+    Returns ``None`` only for ``prompt_tokens == 0``.
+    """
+    if info is None or info.prompt_tokens <= 0:
+        return None
+    if info.cached_tokens <= 0 and not (info.restored_tokens or 0):
+        return "miss"
+    if info.restored_tokens or (info.hint and _hint_is_restore(info.hint)):
+        return "restore"
+    if info.cached_ratio >= full_hit_ratio:
+        return "device_hit"
+    return "partial"
+
+
+_RESTORE_WORDS = ("restore", "remote", "host", "cpu", "kvstore", "store", "mooncake", "lmcache", "hicache")
+_DEVICE_WORDS = ("device", "gpu", "hbm", "local", "dram", "vram")
+
+
+def _hint_is_restore(hint: str) -> bool:
+    """A hint names a restore tier if it mentions one and not a device tier."""
+    h = hint.lower()
+    if any(w in h for w in _DEVICE_WORDS):
+        return False
+    return any(w in h for w in _RESTORE_WORDS)
+
+
 def _warn_missing_usage_once(request: Request) -> None:
+
     """Warn once if the request asked for usage but the response carried none.
 
     Only fires when ``stream_options.include_usage`` was set on the request, so

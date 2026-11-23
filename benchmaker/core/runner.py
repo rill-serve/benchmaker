@@ -73,6 +73,8 @@ class BenchConfig:
     stall_ms: Optional[float] = DEFAULT_STALL_MS
     # Write each sample's raw ``series`` (per-token gaps) to samples.jsonl.
     dump_series: bool = False
+    # ``Sample.meta`` keys to break the summary down by (e.g. ``["cache_class"]``).
+    group_by: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.lanes:
@@ -96,6 +98,7 @@ class BenchRunner:
         self.cfg = config
         self.metrics = MetricsAggregator(
             stall_ms=config.stall_ms,
+            group_by=list(config.group_by),
             dump_series=config.dump_series,
         )
 

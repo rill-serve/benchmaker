@@ -422,6 +422,7 @@ replay:
   streaming: false                   # match the original workload-type's streaming flag
 
 # ---------- measurement knobs (all optional; docs/itl-cache-metrics.md) ----------
+group_by: [cache_class]              # break the summary (and every lane) down by meta keys
 stall_ms: 12                         # inter-token gap above this is a decode stall ("none" disables)
 dump_series: false                   # write every sample's raw per-token series into samples.jsonl
 
