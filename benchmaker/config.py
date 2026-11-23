@@ -442,6 +442,7 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
 
     recorder = _build_recorder(cfg.get("record"))
 
+    stall_ms = cfg.get("stall_ms", cfg.get("stall_threshold_ms"))
     return BenchConfig(
         workload_type=workload_type,
         workload=workload,
@@ -456,8 +457,9 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
         max_in_flight=int(cfg.get("max_in_flight", 10000)),
         progress_every_s=float(cfg.get("progress_every_s", 1.0)),
         stop_on_exhausted=bool(cfg.get("stop_on_exhausted", True)),
+        stall_ms=None if stall_ms in (None, "none", "off", False) else float(stall_ms),
+        dump_series=bool(cfg.get("dump_series", False)),
     )
-
 
 def _build_lanes(spec: Any, *, duration_s: Optional[float],
                  max_requests: Optional[int]) -> list[BenchLane]:

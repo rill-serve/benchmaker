@@ -20,6 +20,12 @@ Captured metrics (on top of base latency/throughput):
     prompt_tokens       from usage block when available
     tokens_per_s        completion_tokens / generation_time
 
+
+Raw per-token inter-token gaps (ms) are kept on every sample as
+``sample.series["itl_ms"]`` and pooled across requests by the summary
+(``itl_ms_pooled`` p50/p90/p99/p99.5/p99.9/max and the ``stalls`` block,
+issue #1); they are written to samples.jsonl when ``dump_series`` is on.
+
 `ttft_token` selects which token the headline `ttft_s` is measured to:
   * `"any"`     (default) — first token the server produces, reasoning *or*
                   content. The engine-cost signal a serving benchmark wants;
@@ -42,6 +48,7 @@ import statistics
 from typing import Any, Optional, Union
 
 from benchmaker.env import load_dotenv
+from benchmaker.core.metrics import ITL_SERIES
 from benchmaker.core.types import Request, Response, Sample
 from benchmaker.workloads._sse import reassemble_sse_lines
 from benchmaker.workloads.base import WorkloadType
@@ -372,6 +379,8 @@ class OpenAIChatWorkloadType(WorkloadType):
             sample.extra["itl_ms_mean"] = statistics.mean(itl)
             sample.extra["itl_ms_p50"] = _pct(itl, 50)
             sample.extra["itl_ms_p99"] = _pct(itl, 99)
+            # Raw gaps: pooled across requests by the summary (issue #1).
+            sample.series[ITL_SERIES] = itl
 
         sample.extra["tokens_out"] = float(completion_tokens)
         # Surface the reasoning/content breakdown from `usage` when the server
@@ -406,7 +415,6 @@ class OpenAIChatWorkloadType(WorkloadType):
             sample.error = sample.error or "no tokens received"
 
         return sample
-
 
 def _warn_missing_usage_once(request: Request) -> None:
     """Warn once if the request asked for usage but the response carried none.

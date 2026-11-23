@@ -15,7 +15,8 @@ Item interpretation:
                 ``Request.meta`` instead of sent.
 
 Captured metrics: ttft_s, itl_ms_mean/p50/p99, tokens_out, prompt_tokens,
-cached_tokens, tokens_per_s, meta.finish_reason.
+cached_tokens, tokens_per_s, meta.finish_reason, and the raw per-token gap
+series ``itl_ms`` pooled by the summary (#1).
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import statistics
 from typing import Any, Optional
 
 from benchmaker.env import load_dotenv
+from benchmaker.core.metrics import ITL_SERIES
 from benchmaker.core.types import Request, Response, Sample
 from benchmaker.workloads._sse import reassemble_sse_lines
 from benchmaker.workloads.base import WorkloadType
@@ -205,6 +207,7 @@ class SGLangGenerateWorkloadType(WorkloadType):
             sample.extra["itl_ms_mean"] = statistics.mean(itl)
             sample.extra["itl_ms_p50"] = _pct(itl, 50)
             sample.extra["itl_ms_p99"] = _pct(itl, 99)
+            sample.series[ITL_SERIES] = itl  # pooled across requests (#1)
         sample.extra["tokens_out"] = float(out_tokens)
         if prompt_tokens is not None:
             sample.extra["prompt_tokens"] = float(prompt_tokens)

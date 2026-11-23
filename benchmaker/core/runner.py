@@ -14,7 +14,7 @@ import httpx2
 logger = logging.getLogger(__name__)
 
 from benchmaker.core.load import LoadModel
-from benchmaker.core.metrics import MetricsAggregator
+from benchmaker.core.metrics import DEFAULT_STALL_MS, ITL_SERIES, MetricsAggregator  # noqa: F401 (re-exported)
 from benchmaker.core.types import (
     PostResponseHook,
     PreRequestHook,
@@ -67,6 +67,12 @@ class BenchConfig:
     max_in_flight: int = 10000
     progress_every_s: float = 1.0
     stop_on_exhausted: bool = True
+    # --- issue #1: token-level ITL pooling and decode stalls -------------
+    # Inter-token gap (ms) above which a decode step counts as a stall;
+    # ``None`` disables the ``stalls`` summary block.
+    stall_ms: Optional[float] = DEFAULT_STALL_MS
+    # Write each sample's raw ``series`` (per-token gaps) to samples.jsonl.
+    dump_series: bool = False
 
     def __post_init__(self) -> None:
         if self.lanes:
@@ -88,7 +94,10 @@ class BenchResult:
 class BenchRunner:
     def __init__(self, config: BenchConfig):
         self.cfg = config
-        self.metrics = MetricsAggregator()
+        self.metrics = MetricsAggregator(
+            stall_ms=config.stall_ms,
+            dump_series=config.dump_series,
+        )
 
     async def run(self) -> BenchResult:
         # httpx2 has no per-connector force_close / ttl_dns_cache knobs; pooling

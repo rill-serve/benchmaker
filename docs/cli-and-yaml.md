@@ -8,8 +8,7 @@ into two groups:
   chat), `sandbox` (Flash Sandbox), `swebench` (SWE-bench Verified eval),
   `sglang` (SGLang native `/generate`), `agentic` (prefix-cache
   parity), and `swebench-replay` (deterministic SWE-bench re-evaluation).
-- **Infra commands** — `run` (drive any benchmark from a YAML config file) and
-  `collect` (pivot many run-dirs into a table).
+- **Infra commands** — `run` (drive any benchmark from a YAML config file) and `collect` (pivot many run-dirs into a table).
 
 > `quick` is a deprecated alias for `http`; it still works but prints a warning.
 
@@ -421,6 +420,10 @@ replay:
   path: traces/run_baseline.jsonl    # input trace path
   speed: 1.0                         # speed multiplier (2.0 = twice as fast)
   streaming: false                   # match the original workload-type's streaming flag
+
+# ---------- measurement knobs (all optional; docs/itl-cache-metrics.md) ----------
+stall_ms: 12                         # inter-token gap above this is a decode stall ("none" disables)
+dump_series: false                   # write every sample's raw per-token series into samples.jsonl
 
 # ---------- runner knobs (all optional) ----------
 connection_limit: 1000               # aiohttp TCPConnector limit
