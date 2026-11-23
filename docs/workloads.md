@@ -158,6 +158,32 @@ and from there into `Sample.meta`, so dataset tags (`visit`, `doc_id`,
 use this; with `passthrough_meta: true` the same happens for any JSONL
 column.
 
+### `OpenAICompletionsWorkloadType`
+
+OpenAI-compatible `/v1/completions` with SSE streaming — the text-
+completions wire format (`choices[*].text`, `finish_reason: "stop"`,
+`usage`). Same kwargs and behaviour as the chat type (`extra_body`,
+`passthrough_meta`, sampling kwargs such as `ignore_eos`, `timeout_s`, …),
+but the item is the `prompt` itself:
+
+- a string → `"prompt": "..."`, `meta.prompt_kind = "text"`;
+- a list of ints → `"prompt": [id, ...]`, `meta.prompt_kind = "token_ids"`
+  — the server skips tokenization (vLLM, SGLang and TGI accept it), which is
+  what [trace replay](trace-replay.md#send-token_ids-bypass-the-tokenizer-11)
+  uses for page-aligned prefixes;
+- a list of strings → batched prompts;
+- a dict → `{"prompt": ..., **body overrides, "meta": {...}}` like the chat
+  type's dict items (chat `messages` are refused).
+
+```python
+OpenAICompletionsWorkloadType(
+    url="http://localhost:8000/v1/completions",
+    model="qwen2.5-32b",
+    stream=True,
+    ignore_eos=True,
+)
+```
+
 ### `DeepRAGWorkload`
 
 `DeepRAGWorkload` reads prepared multi-passage QA JSONL and builds a short

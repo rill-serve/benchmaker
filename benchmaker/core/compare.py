@@ -132,11 +132,20 @@ class RunRef:
                    manifest=b.get("manifest"), meta=b.get("meta"), warmup=warmup)
 
     def is_void(self) -> Optional[dict]:
-        """The void verdict (issue #4) if this run was marked void."""
+        """The void verdict (issue #4) if this run was marked void.
+
+        ``meta.void`` is a bool in real bundles (``write_bundle`` stores the
+        verdict flag and lists the reasons in ``meta.void_violations``); a
+        dict ``{"void": True, ...}`` is accepted too. Returns
+        ``{"void": True, "violations": [...]}`` so callers can show why."""
         if not self.meta:
             return None
         v = self.meta.get("void")
-        return v if isinstance(v, dict) and v.get("void") else None
+        if isinstance(v, dict):
+            return v if v.get("void") else None
+        if v is True:
+            return {"void": True, "violations": list(self.meta.get("void_violations") or [])}
+        return None
 
 
 def load_runs(arm_dirs: dict[str, Iterable[str]]) -> list[RunRef]:

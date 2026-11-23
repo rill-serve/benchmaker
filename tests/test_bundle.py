@@ -22,7 +22,7 @@ from benchmaker.io.bundle import (
     META_FILENAME,
     SUMMARY_FILENAME,
     SAMPLES_FILENAME,
-    write_bundle,
+    patch_bundle,
 )
 from benchmaker.io.collect import collect_table, find_bundles, format_table
 
@@ -191,3 +191,59 @@ async def test_cli_run_writes_bundle(stub_server: str, tmp_path):
     assert "label.variant" in csv_text.splitlines()[0]
     assert "cli-a" in csv_text
     assert "cli" in csv_text
+
+
+@pytest.mark.asyncio
+async def test_patch_bundle_merges_hooks_and_void_after_the_fact(stub_server: str, tmp_path):
+    """Issue #9: a stop hook / teardown check runs *after* the bundle is written."""
+    runner = await _quick_run(stub_server)
+    path = runner.write_bundle(str(tmp_path), run_id="patched", source_config={"load": "20"},
+                               hooks={"start": {"exit_code": 0, "command": "launch.sh"}})
+    patch_bundle(path, hooks={"stop": {"exit_code": 0, "command": "stop.sh"}},
+                 void_violations=[{"rule": "post_stop_check", "path": "arm", "expected": "clean",
+                                   "actual": "gpu busy", "reason": "teardown check failed", "at": "end"}])
+    b = read_bundle(path)
+    assert set(b["meta"]["hooks"]) == {"start", "stop"}
+    assert b["meta"]["void"] is True and b["meta"]["void_violations"][0]["rule"] == "post_stop_check"
+    assert b["summary"]["void"]["void"] is True and len(b["summary"]["void"]["violations"]) == 1
+    # a bundle without hooks has no "hooks" key at all
+    plain = runner.write_bundle(str(tmp_path), run_id="plain")
+    assert "hooks" not in read_bundle(plain)["meta"]
+
+
+@pytest.mark.asyncio
+async def test_per_endpoint_capability_files_roundtrip(stub_server: str, tmp_path):
+    """Issue #8: one capability.<model>.{start,end}.json pair per endpoint."""
+    from benchmaker.io.bundle import capability_filenames
+    runner = await _quick_run(stub_server)
+    start_name, end_name = capability_filenames("model/a:v1")
+    assert start_name == "capability.model_a_v1.start.json" and end_name.endswith(".end.json")
+    runner.capability = {"endpoints": {
+        "a": {"start": {"ok": True, "model": "a"}, "end": {"ok": True, "model": "a"}},
+        "b": {"start": {"ok": False, "error": "down"}, "end": None},
+    }}
+    path = runner.write_bundle(str(tmp_path), run_id="eps", source_config={})
+    assert (tmp_path / "eps" / capability_filenames("a")[0]).is_file()
+    assert (tmp_path / "eps" / capability_filenames("a")[1]).is_file()
+    assert not (tmp_path / "eps" / capability_filenames("b")[1]).exists()
+    assert not (tmp_path / "eps" / "capability.start.json").exists()
+    caps = read_bundle(path)["capability"]
+    assert caps["start"] is None and caps["end"] is None
+    assert caps["endpoints"]["a"]["start"]["model"] == "a" and caps["endpoints"]["b"]["end"] is None
+
+
+@pytest.mark.asyncio
+async def test_runref_is_void_reads_bool_verdict(stub_server: str, tmp_path):
+    """Real bundles store ``meta.void`` as a bool; compare must honour it."""
+    from benchmaker.core.compare import RunRef, compare
+    runner = await _quick_run(stub_server)
+    ok = runner.write_bundle(str(tmp_path / "ok"), run_id="r0")
+    bad = runner.write_bundle(str(tmp_path / "bad"), run_id="r0", source_config={})
+    patch_bundle(bad, void_violations=[{"rule": "ready_check", "path": "x", "expected": 200,
+                                        "actual": 0, "reason": "not ready", "at": "start"}])
+    assert RunRef.from_bundle("ok", 0, ok).is_void() is None
+    v = RunRef.from_bundle("bad", 0, bad).is_void()
+    assert v["void"] is True and v["violations"][0]["rule"] == "ready_check"
+    runs = [RunRef.from_bundle("ok", 0, ok), RunRef.from_bundle("bad", 0, bad)]
+    table = compare(runs, ["ttft_p50"], "ok")
+    assert table["void"] == {"bad": v} and table["arms"]["bad"]["reps"] == 0

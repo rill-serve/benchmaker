@@ -37,6 +37,13 @@ A request whose `input_length` is not a multiple of 512 is the last block
 padded with a request-unique tail. The published data's timestamps are
 milliseconds relative to the first request.
 
+Text rendering has two sources of drift, though: the server's tokenizer may
+merge characters across a block boundary (so block *b* does not start on a
+fresh token), and `/v1/chat/completions` prepends the chat template, which
+shifts every block off the 512-token grid the trace was recorded on. For a
+prefix-cache experiment that grid *is* the point — see
+[`send: token_ids`](#send-token_ids-bypass-the-tokenizer-11).
+
 ## Getting the files
 
 ```bash
@@ -66,6 +73,7 @@ workload:
   max_duration_s: 600           # requests arriving in the first 10 minutes
   max_input_tokens: 16384
   max_output_tokens: 2048
+  max_seq: 32768                # input + output > max_seq -> row dropped (issue #11)
   # --- rendering ---
   tokenizer: Qwen/Qwen2.5-7B    # token-exact prompts (needs `pip install -e .[hf]`); default: char mode
   chars_per_token: 4.0          # char mode only
@@ -73,6 +81,10 @@ workload:
   match_output_tokens: true     # max_tokens = output_length (false: a fixed max_tokens)
   max_tokens: 256               # used when match_output_tokens is false, and as a cap
   loop: false                   # restart the trace when exhausted
+  # --- issue #11 ---
+  send: text                    # text | token_ids (see below)
+  namespace: null               # null | <string> | model — salt block content per served model
+  unique_tail: 0                # append N request-unique tokens after the last block
 
 load:
   type: trace                   # one ticket per record at its own arrival time (TraceArrivalsLoad)
@@ -94,6 +106,56 @@ Workload types `mooncake-trace` / `azure-trace` set the source explicitly;
 `trace-replay` sniffs the file (`.parquet` → column names; CSV header with
 `TIMESTAMP` + `ContextTokens` → azure; otherwise mooncake).
 
+Rows removed by `max_input_tokens` / `max_output_tokens` / `max_seq` are
+counted per reason and land in `manifest.json` under
+`prompt_set.provenance.dropped` (together with the replay parameters), so a
+reader can see that the "same" trace gave two runs different populations.
+
+### `send: token_ids` — bypass the tokenizer (issue #11)
+
+With `send: token_ids` every block is rendered as **token ids**, not text,
+and sent as `prompt: [ids]` to `/v1/completions`:
+
+```yaml
+workload_type:
+  type: openai-completions      # POST /v1/completions; `prompt` may be a list of ints
+  url: http://localhost:8000/v1/completions
+  model: qwen2.5-32b
+  stream: true
+  ignore_eos: true
+workload:
+  type: mooncake-trace
+  path: .local/mooncake_trace.jsonl.gz
+  send: token_ids
+  tokenizer: Qwen/Qwen2.5-7B    # defines the whitelist of sendable ids (special/added tokens removed)
+  # vocab_size: 151936          # …or, without a local tokenizer: [0, vocab_size) minus …
+  # exclude_ids: [151643, 151644]
+  # exclude_last: 64            # … the reserved ids / the last N ids
+  namespace: model              # per-model block content when several models share one trace
+  unique_tail: 16               # whole-prompt duplicates stop being byte-identical
+```
+
+Why ids: nothing is tokenized server-side, so no block boundary can merge
+and no chat template shifts the alignment. Every hash block is exactly
+`block_size` ids seeded from its hash id, a truncated last block is the true
+prefix of the full one, and equal hash ids give **byte-identical,
+page-aligned** prefixes — the sharing graph the cache sees is exactly the
+one Mooncake recorded. `prompt_tokens` from the server equals the recorded
+`input_length` (+ `unique_tail`).
+
+| Knob         | Effect                                                                                                      |
+| ------------ | ----------------------------------------------------------------------------------------------------------- |
+| `tokenizer`  | HF id or loaded tokenizer: the whitelist is its vocab minus `all_special_ids` and added tokens (BOS/EOS/PAD, chat control tokens — ids that could end generation early or trip a parser). |
+| `vocab_size` | Without a tokenizer: ids are drawn from `[0, vocab_size)` minus `exclude_ids` minus the last `exclude_last` ids. State your tokenizer's reserved range. |
+| `namespace`  | Salt mixed into every block seed, so runs of several models from one trace get disjoint block content (a cache warmed by another model's rehearsal is a fake hit). `namespace: model` resolves to the workload-type's (or lane's) `model`; unset keeps the pre-#11 seeds and prompt-set hash. |
+| `unique_tail`| Append N request-unique ids after the last block. Requests with identical `hash_ids` — whole-prompt duplicates in the trace — keep the shared prefix but stop being the same prompt. `prompt_tokens_hint` reflects the real size. |
+
+`send: token_ids` with `type: openai` is refused (chat completions cannot
+take a list of ids). The `openai-completions` workload-type parses the
+`/v1/completions` SSE stream (`choices[*].text`) and otherwise behaves like
+the chat type (`passthrough_meta`, `extra_body`, `ignore_eos`, …); its
+samples carry `meta.prompt_kind = text|token_ids` and `meta.prompt_len`.
+
 ## What is recorded
 
 Each item carries the trace fields in `meta`, which reach `samples.jsonl`
@@ -108,7 +170,14 @@ as `meta` and (for the numeric ones) as `extra` metrics summarized in
 | `trace_output_tokens`      | `meta`, `extra`  | recorded output length                    |
 | `trace_blocks`             | `meta`, `extra`  | number of hash blocks (0 for Azure)       |
 | `prompt_tokens_hint`       | `extra`          | rendered prompt size (tokens)             |
+| `prompt_kind`              | `meta`           | `text` or `token_ids` (`openai-completions`) |
+| `trace_unique_tail`        | `meta`, `extra`  | `unique_tail` in effect                    |
 | `cache_class`              | `meta`           | `device_hit` / `restore` / `partial` / `miss` |
+
+`manifest.json` → `prompt_set` records the replay next to the content hash:
+`provenance: {source, path, records, send, namespace, unique_tail,
+block_size, tokenizer, token_whitelist: {size, source}, max_seq, dropped:
+{<reason>: n}}`.
 
 So a run reports the trace's token distribution (`trace_input_tokens.p50`,
 `…max`) next to what the server measured (`prompt_tokens`, `cached_tokens`),
@@ -146,10 +215,15 @@ sort by arrival and subtract the first timestamp so `t_s` starts at 0.
 
 ## Caveats
 
-- **Prompts are synthetic text**, not the original conversations (those are
-  not in the traces). Only sizes and sharing structure are faithful; if a
+- **Prompts are synthetic**, not the original conversations (those are not
+  in the traces). Only sizes and sharing structure are faithful; if a
   model's tokenization makes the synthetic blocks denser than real prose,
-  use `tokenizer:` to be token-exact.
+  use `tokenizer:` to be token-exact — or `send: token_ids`, which is exact
+  by construction (the ids are then random whitelisted tokens, not words;
+  fine for cache/throughput experiments, meaningless for quality).
+- **Token-id prompts need a server that accepts `prompt: [ids]`** on
+  `/v1/completions` (vLLM, SGLang, TGI do) and a whitelist matching its
+  tokenizer; ids outside the server's vocab are rejected.
 - **Azure has no prefix information**, so every request is a cold prompt of
   its recorded size: it measures prefill/decode throughput under the
   production arrival process, not caching. Wrap several records behind a

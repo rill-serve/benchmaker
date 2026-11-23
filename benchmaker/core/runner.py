@@ -11,13 +11,13 @@ from typing import Any, Optional
 
 import httpx2
 
-logger = logging.getLogger(__name__)
-
 from benchmaker.core.capability import (
     VoidRule,
     evaluate_void_rules,
     fetch_json,
+    merge_void_verdicts,
 )
+from benchmaker.core.endpoints import endpoint_model, route_url
 from benchmaker.core.load import LoadModel
 from benchmaker.core.metrics import DEFAULT_STALL_MS, ITL_SERIES, WARMUP_META_KEY, MetricsAggregator  # noqa: F401 (re-exported)
 from benchmaker.core.types import (
@@ -33,6 +33,13 @@ from benchmaker.core.monitors import Monitor, run_monitor_loop
 from benchmaker.core.trace import TraceRecorder
 from benchmaker.workloads.base import WorkloadType
 from benchmaker.workloads.datasets import Workload, StaticWorkload
+
+logger = logging.getLogger(__name__)
+
+
+def _workload_url(wt: Any) -> Optional[str]:
+    """The workload-type's request URL (public ``url`` attribute or ``_url``)."""
+    return getattr(wt, "url", None) or getattr(wt, "_url", None)
 
 
 @dataclass
@@ -133,6 +140,14 @@ class BenchConfig:
     # var globs recorded in the manifest in addition to the defaults.
     model_revision: Optional[str] = None
     record_env: list[str] = field(default_factory=list)
+    # --- issue #8: several servers (one per model) behind one arm ----------
+    # ``{model: {url, capability?, headers?}}`` (see core/endpoints.py). A
+    # request whose body ``model`` matches a key is sent to that endpoint;
+    # capability, void rules and the manifest run per endpoint.
+    endpoints: dict[str, dict] = field(default_factory=dict)
+    # Extra void violations to record (lifecycle checks run by `benchmaker
+    # arms`, issue #9) — merged into ``summary["void"]`` on every write.
+    extra_void: list[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.phases:
@@ -159,7 +174,8 @@ class BenchConfig:
 class BenchResult:
     samples: list[Sample]
     summary: dict
-    # Capability snapshots (``{"start": ..., "end": ...}``) when configured.
+    # Capability snapshots: ``{"start": ..., "end": ...}``, or with an
+    # endpoint map (issue #8) ``{"endpoints": {model: {"start", "end"}}}``.
     capability: Optional[dict[str, Any]] = None
 
 
@@ -187,7 +203,7 @@ class BenchRunner:
         timeout = httpx2.Timeout(self.cfg.timeout_s)
         if self.cfg.recorder is not None:
             self.cfg.recorder.open(start_mono=self.metrics.start_time)
-        if self.cfg.capability:
+        if self.cfg.capability or self.cfg.endpoints:
             await self._capture("start")
         async with httpx2.AsyncClient(limits=limits, timeout=timeout) as session:
             try:
@@ -198,7 +214,7 @@ class BenchRunner:
                 if self.cfg.recorder is not None:
                     self.cfg.recorder.close()
         self.metrics.finalize()
-        if self.cfg.capability:
+        if self.cfg.capability or self.cfg.endpoints:
             await self._capture("end")
         return BenchResult(
             samples=self.metrics.samples,
@@ -210,10 +226,29 @@ class BenchRunner:
         summary = self.metrics.summary()
         if self.capability is not None:
             summary["capability"] = self.capability
-            verdict = evaluate_void_rules(
-                self.cfg.void_rules, self.capability.get("start"), self.capability.get("end"))
-            summary["void"] = verdict.to_dict()
+            summary["void"] = self.void_verdict()
+        elif self.cfg.extra_void:
+            summary["void"] = self.void_verdict()
         return summary
+
+    def void_verdict(self) -> dict:
+        """``{"void", "violations", "checks"}`` over every endpoint's snapshots
+        (issue #8) plus any lifecycle violations recorded in ``cfg.extra_void``
+        (issue #9)."""
+        verdicts: list[dict] = []
+        per = (self.capability or {}).get("endpoints")
+        if per:
+            for name, snaps in per.items():
+                verdicts.append(evaluate_void_rules(
+                    self.cfg.void_rules, snaps.get("start"), snaps.get("end"),
+                    endpoint=name).to_dict())
+        else:
+            verdicts.append(evaluate_void_rules(
+                self.cfg.void_rules, (self.capability or {}).get("start"),
+                (self.capability or {}).get("end")).to_dict())
+        if self.cfg.extra_void:
+            verdicts.append({"void": True, "violations": list(self.cfg.extra_void), "checks": []})
+        return merge_void_verdicts(verdicts)
 
     def is_void(self) -> bool:
         """True when a [void rule](../core/capability.py) was violated (issue #4)."""
@@ -221,14 +256,53 @@ class BenchRunner:
         return bool(verdict and verdict.get("void"))
 
     async def _capture(self, at: str) -> None:
-        cap = self.cfg.capability or {}
-        snapshot = await asyncio.to_thread(
-            fetch_json, cap.get("url", ""), float(cap.get("timeout_s", 10.0)), cap.get("headers"))
-        snapshot["at"] = at
-        snapshot["wall_time"] = time.time()
-        self.capability = {**(self.capability or {}), at: snapshot}
-        if not snapshot.get("ok"):
-            logger.warning("capability snapshot (%s) failed: %s", at, snapshot.get("error"))
+        """Snapshot every capability source at ``at`` (``start`` | ``end``).
+        Without an endpoint map that is the single ``cfg.capability``; with
+        one (issue #8) each endpoint's capability URL — given explicitly or
+        derived from the shared ``capability.url`` by swapping scheme/host —
+        is captured separately."""
+        sources = self._capability_sources()
+        if not sources:
+            return
+        if len(sources) == 1 and sources[0][0] is None:
+            _, cap = sources[0]
+            snapshot = await asyncio.to_thread(
+                fetch_json, cap["url"], float(cap.get("timeout_s", 10.0)), cap.get("headers"))
+            snapshot["at"] = at
+            snapshot["wall_time"] = time.time()
+            self.capability = {**(self.capability or {}), at: snapshot}
+            if not snapshot.get("ok"):
+                logger.warning("capability snapshot (%s) failed: %s", at, snapshot.get("error"))
+            return
+        per = dict((self.capability or {}).get("endpoints") or {})
+        for name, cap in sources:
+            snapshot = await asyncio.to_thread(
+                fetch_json, cap["url"], float(cap.get("timeout_s", 10.0)), cap.get("headers"))
+            snapshot["at"] = at
+            snapshot["wall_time"] = time.time()
+            snapshot["endpoint"] = name
+            per[name] = {**per.get(name, {}), at: snapshot}
+            if not snapshot.get("ok"):
+                logger.warning("capability snapshot (%s, endpoint %s) failed: %s", at, name, snapshot.get("error"))
+        self.capability = {**(self.capability or {}), "endpoints": per}
+
+    def _capability_sources(self) -> list[tuple[Optional[str], dict]]:
+        """``[(endpoint_name_or_None, {url, headers?, timeout_s?})]`` for every
+        endpoint that has a capability URL."""
+        base = dict(self.cfg.capability or {})
+        if not self.cfg.endpoints:
+            return [(None, base)] if base.get("url") else []
+        out = []
+        for name, spec in self.cfg.endpoints.items():
+            cap = {**base, **{k: v for k, v in spec.items() if k != "url" and v}}
+            if spec.get("capability"):
+                cap["url"] = spec["capability"]
+            elif base.get("url"):
+                cap["url"] = route_url(spec["url"], base["url"])
+            cap["headers"] = {**(base.get("headers") or {}), **(spec.get("headers") or {})}
+            if cap.get("url"):
+                out.append((name, cap))
+        return out
 
     def _is_warmup(self, start_mono: float) -> bool:
         if self.cfg.warmup_requests and self._fired < self.cfg.warmup_requests:
@@ -382,6 +456,7 @@ class BenchRunner:
                     req.meta.setdefault(k, v)
                 for hook in self.cfg.pre_hooks:
                     req = await maybe_await(hook(req))
+                self._route(req)
                 fire_start = time.monotonic()
                 if self.cfg.recorder is not None:
                     await self.cfg.recorder.record(req, fire_start)
@@ -417,6 +492,23 @@ class BenchRunner:
         finally:
             sem.release()
             load.on_complete()
+
+    def _route(self, req: Request) -> None:
+        """Issue #8: with an endpoint map, the request's body ``model`` (a
+        lane's ``model``, or a workload item's) selects the server. The
+        endpoint's URL/headers are applied and the served model is stamped
+        into ``meta`` so per-model summaries (`group_by: [model]`) work."""
+        if not self.cfg.endpoints:
+            return
+        name = endpoint_model(req.json, req.meta, self.cfg.endpoints)
+        if name is None:
+            return
+        spec = self.cfg.endpoints[name]
+        req.url = route_url(spec["url"], req.url)
+        for k, v in spec.get("headers", {}).items():
+            req.headers.setdefault(k, v)
+        req.meta.setdefault("model", name)
+        req.meta["endpoint"] = name
 
     async def _aclose_workloads(self) -> None:
         workloads: list[Workload] = []
@@ -574,6 +666,8 @@ class BenchRunner:
                 env=env_overrides,
                 record_env=record_env,
                 benchmaker_version=bm_version,
+                endpoints=self.cfg.endpoints or None,
+                template_url=_workload_url(self.cfg.workload_type),
             )
         return write_bundle(
             out_dir,
