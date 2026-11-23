@@ -36,6 +36,8 @@ DEFAULT_COLUMNS: list[tuple[str, str]] = [
     ("p90_s", "summary.latency_s.p90"),
     ("p99_s", "summary.latency_s.p99"),
     ("max_s", "summary.latency_s.max"),
+    # "VOID" when a void rule was violated (issue #4); empty otherwise.
+    ("void", "meta.void"),
 ]
 
 
@@ -96,7 +98,14 @@ def collect_table(
         bundle = read_bundle(d)
         meta = bundle["meta"]
         summary = bundle["summary"]
-        ctx = {"meta": meta, "summary": summary}
+        # manifest.* and capability.* are addressable from --metric (#4);
+        # they are None for bundles written before the manifest existed.
+        ctx = {
+            "meta": meta,
+            "summary": summary,
+            "manifest": bundle.get("manifest") or {},
+            "capability": bundle.get("capability") or {},
+        }
 
         row: dict[str, Any] = {}
         for col, path in DEFAULT_COLUMNS:
@@ -104,8 +113,9 @@ def collect_table(
         for lk in label_keys:
             row[f"label.{lk}"] = (meta.get("labels") or {}).get(lk)
         for m in extra_metrics:
-            # Allow the user to write `summary.foo` or just `foo` (assumes summary.*).
-            if m.startswith("meta.") or m.startswith("summary."):
+            # Qualified paths (meta./summary./manifest./capability.) resolve
+            # against the bundle context; a bare path assumes summary.*.
+            if any(m.startswith(p) for p in ("meta.", "summary.", "manifest.", "capability.")):
                 row[m] = _dotted_get(ctx, m)
             else:
                 row[m] = _dotted_get(summary, m)
@@ -144,6 +154,8 @@ def _format_csv(rows: list[dict[str, Any]], columns: list[str]) -> str:
 def _csv_cell(v: Any) -> Any:
     if v is None:
         return ""
+    if isinstance(v, bool):
+        return str(v).lower()
     if isinstance(v, float):
         return f"{v:.6g}"
     return v
@@ -167,6 +179,10 @@ def _format_md(rows: list[dict[str, Any]], columns: list[str]) -> str:
 
 def _md_cell(v: Any) -> str:
     if v is None:
+        return ""
+    if v is True:
+        return "VOID"
+    if v is False:
         return ""
     if isinstance(v, float):
         # Compact, but keep small-magnitude numbers readable.

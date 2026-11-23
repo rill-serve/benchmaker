@@ -161,6 +161,18 @@ Full docs live in [`docs/`](docs/):
 - [TraceLab benchmark](docs/tracelab.md) — replay real coding-agent (Claude/Codex) token + prefix-cache distributions
 - [SGLang benchmark](docs/sglang.md) — native SGLang `/generate` benchmark
 - [Agentic](docs/agentic.md) — multi-turn prefix-cache parity replay
+- [Decode stalls, cache classes, TTFT parity](docs/itl-cache-metrics.md) —
+  pooled ITL percentiles, stall accounting, per-cache-class summaries and the
+  TTFT mix/latency decomposition
+- [Capability, manifest, void runs](docs/capability-manifest.md) — server
+  self-description snapshots, `manifest.json`, `void_rules`
+- [Phases, warm-up, capacity-revisit](docs/phases-capacity.md) — timed stages
+  with their own lanes, excluded warm-up, and the warm/revisit working-set
+  workload
+- [Multi-arm comparisons](docs/arms.md) — `benchmaker arms` / `compare`:
+  interleaved reps, per-rep bundles, same-job enforcement, comparison table
+- [Replaying published traces](docs/trace-replay.md) — Mooncake (block-hash
+  prefix structure) and Azure LLM inference traces with real arrival times
 
 ## Deterministic replay (`swebench-replay`)
 

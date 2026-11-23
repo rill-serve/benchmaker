@@ -57,6 +57,13 @@ class Sample:
     workload: Optional[str] = None
     meta: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, float] = field(default_factory=dict)
+    # Raw per-event series (e.g. per-token inter-token gaps in ms under
+    # ``"itl_ms"``). Unlike ``extra`` (one number per request), a series keeps
+    # every observation so the summary can pool them *across* requests — the
+    # token-level ITL percentiles and decode-stall metrics of issue #1. Series
+    # are kept in memory for every run and written to samples.jsonl only when
+    # ``dump_series`` is on (#1).
+    series: dict[str, list[float]] = field(default_factory=dict)
 
 
 # Hook signatures. Hooks may be sync or async; the runner awaits coroutines and
@@ -89,6 +96,10 @@ class TicketContext:
     pre_hooks: tuple = ()
     post_hooks: tuple = ()
     workload_name: str = "workload-type"
+    # Per-lane request overrides (e.g. ``{"model": "other-model"}``): a
+    # multi-model phase can point one lane at a different model behind the
+    # same endpoint without building a second workload-type (#5).
+    overrides: dict[str, Any] = field(default_factory=dict)
 
 
 async def maybe_await(value: Any) -> Any:

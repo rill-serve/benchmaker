@@ -62,8 +62,11 @@ import random
 import zipfile
 from typing import Any, Iterable, Optional
 
+from benchmaker.workloads import _tokens
 from benchmaker.workloads.datasets import Workload
 
+# Filler vocabulary lives in benchmaker.workloads._tokens (shared).
+_FILLER_WORDS = _tokens.FILLER_WORDS
 
 # Field name conventions in the published TraceLab JSONL.
 F_INPUT_TOTAL = "input_tokens_total"
@@ -81,16 +84,6 @@ F_TOOLS = "tools"
 DEFAULT_CHARS_PER_TOKEN = 4.0
 
 # A small pool of coding-ish words used to build filler text in char mode.
-# Joined with spaces it looks vaguely like prose, tokenizes sanely, and — being
-# a pure function of position within a session — keeps prefix nesting exact.
-_FILLER_WORDS = (
-    "def", "return", "self", "data", "value", "context", "model", "request",
-    "response", "config", "cache", "input", "output", "token", "prompt",
-    "message", "session", "round", "tool", "result", "agent", "stream",
-    "client", "server", "param", "state", "event", "trace", "parse", "load",
-)
-
-
 class TraceLabWorkload(Workload):
     """Replay TraceLab coding-agent rounds as token-faithful chat requests.
 
@@ -451,84 +444,25 @@ class TraceLabWorkload(Workload):
 # --------------------------------------------------------------------------- #
 
 
+# Sizers live in benchmaker.workloads._tokens (shared with the cache-trace
+# replay workloads). Seeds are hashed with a process-stable hash so filler text
+# is identical across runs and processes — a prerequisite for the prompt-set
+# hash in the run manifest (issue #4) to mean anything.
+_CharSizer = _tokens.CharSizer
+_TokenizerSizer = _tokens.TokenizerSizer
+_Sizer = _tokens.CharSizer | _tokens.TokenizerSizer
+
+
 def _build_sizer(tokenizer_id: Optional[str], chars_per_token: float) -> "_Sizer":
-    if tokenizer_id:
-        return _TokenizerSizer(tokenizer_id)
-    return _CharSizer(chars_per_token)
-
-
-class _CharSizer:
-    """Char-based filler: deterministic word stream sliced to a char target."""
-
-    def __init__(self, chars_per_token: float):
-        self._cpt = chars_per_token
-
-    def fill(self, seed: Any, target_tokens: int) -> str:
-        target_tokens = max(1, int(target_tokens))
-        target_chars = max(1, round(target_tokens * self._cpt))
-        return _filler_text(seed, target_chars)
-
-
-class _TokenizerSizer:
-    """Exact filler: repeat a single-token unit ``target_tokens`` times."""
-
-    def __init__(self, tokenizer_id: str):
-        try:
-            from transformers import AutoTokenizer  # type: ignore
-        except ImportError as e:  # pragma: no cover - exercised via message
-            raise ImportError(
-                "TraceLabWorkload(tokenizer=...) needs the `transformers` "
-                "package. Install with `pip install -e .[tokenizer]`."
-            ) from e
-        self._tok = AutoTokenizer.from_pretrained(tokenizer_id)
-        self._unit = _single_token_unit(self._tok)
-
-    def fill(self, seed: Any, target_tokens: int) -> str:
-        n = max(1, int(target_tokens))
-        return self._unit * n
-
-
-def _single_token_unit(tokenizer: Any) -> str:
-    """Find a short string that encodes to exactly one token.
-
-    Repeating it then yields exactly N tokens, and any prefix of ``unit * N`` is
-    byte-exact with ``unit * (N + k)`` — keeping session prefix nesting exact.
-    """
-    candidates = ("x", " x", "a", " a", "0", ".", "word")
-    for cand in candidates:
-        ids = tokenizer.encode(cand, add_special_tokens=False)
-        if len(ids) == 1:
-            return cand
-    # Fall back to whatever the first candidate encodes to; sizes will be close
-    # but not exact. (Unlikely path for mainstream tokenizers.)
-    return "x"
+    return _tokens.build_sizer(tokenizer_id, chars_per_token)
 
 
 def _filler_text(seed: Any, char_count: int) -> str:
-    """Deterministic filler of ~char_count chars, stable per seed+position."""
-    rng = random.Random(_hash_seed(seed))
-    words = _FILLER_WORDS
-    nwords = len(words)
-    out = io.StringIO()
-    written = 0
-    i = 0
-    while written < char_count:
-        w = words[(i + rng.randrange(0, nwords)) % nwords]
-        if i:
-            out.write(" ")
-            written += 1
-        out.write(w)
-        written += len(w)
-        i += 1
-    text = out.getvalue()
-    return text[:char_count]
+    return _tokens.filler_text(seed, char_count)
 
 
 def _hash_seed(seed: Any) -> int:
-    """Reduce an arbitrary seed to a stable int for random.Random."""
-    if isinstance(seed, int):
-        return seed
-    return abs(hash(str(seed))) % (2 ** 31)
+    return _tokens.stable_hash(seed)
 
 
 def _round_sort_key(row: dict[str, Any]) -> tuple:

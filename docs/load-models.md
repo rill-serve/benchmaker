@@ -117,6 +117,7 @@ load:
 | `closed` / `closed-loop` / `concurrency` | `concurrency`, `duration`, `max_requests` |
 | `ramp`     | `start_rps`, `end_rps`, `duration`, `poisson` (bool), `seed` |
 | `sweep`    | `stages` (list of sub-spec dicts, each with its own `type` / keys); optional `label` per stage |
+| `trace` / `trace-arrivals` / `arrivals` | `speed`, `max_requests` — one ticket per workload item at the item's own recorded arrival time (see below) |
 
 **`sweep` example:**
 
@@ -136,6 +137,25 @@ load:
       duration: 30s
       label: peak
 ```
+
+## Trace arrivals (`TraceArrivalsLoad`)
+
+For [serving-trace replay](trace-replay.md) the load model is the trace
+itself: ticket *i* is fired at `arrival_times[i] / speed` seconds after
+start, **in record order** (not re-sorted, because ticket *i* belongs to
+workload item *i* — every request must get its own prompt *and* its own
+arrival). Tickets whose time has already passed fire immediately (open-loop
+catch-up); `max_requests` caps the count.
+
+```yaml
+workload: {type: mooncake-trace, path: .local/mooncake_trace.jsonl.gz, max_duration_s: 600}
+load: {type: trace, speed: 2.0}
+```
+
+`load: {type: trace}` requires a workload that exposes `arrival_times`
+(`trace-replay`, `mooncake-trace`, `azure-trace`); benchmaker refuses it
+otherwise. For the same prompt population without the arrival pattern, use
+any other load model.
 
 ## Duration parsing
 

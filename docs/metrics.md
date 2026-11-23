@@ -27,11 +27,19 @@ Each run produces one directory:
 
 ```
 runs/<run_id>/
-    meta.json       # run identifiers, timestamps, resolved source config
-    summary.json    # aggregated metrics (the dict described below)
-    samples.jsonl   # one JSON record per request
-    monitors.jsonl  # one JSON record per monitor tick (only if monitors ran)
+    meta.json              # run identifiers, timestamps, resolved source config, void flag
+    manifest.json          # what was actually benchmarked: config hash, prompt-set hash,
+                           #   model id/revision, host + job id, env knobs (docs/capability-manifest.md)
+    summary.json           # aggregated metrics (the dict described below)
+    samples.jsonl          # one JSON record per request
+    monitors.jsonl         # one JSON record per monitor tick (only if monitors ran)
+    capability.start.json  # server self-description before the run (only if `capability:` configured)
+    capability.end.json    # ... and after it
 ```
+
+Multi-arm runs nest bundles under `runs/<run_id>/arms/<arm>/rep-<k>/` and add
+`plan.json`, `arms.log`, `comparison.json` and `comparison.md` at the root
+(see [Multi-arm comparisons](arms.md)).
 
 `run_id` defaults to a UTC timestamp like `20260526T142233Z`. Pass `--run-id`
 to set it explicitly. The directory is the unit of result interchange — copy
@@ -89,10 +97,23 @@ repeatedly on the CLI; pass `labels={...}` from Python.
     # Per-workload-type extras (when present) — e.g. for OpenAIChatWorkloadType:
     "workload_metrics": {
         "ttft_s":       {"mean": 0.18, "p50": 0.16, "p90": 0.32, "p99": 0.55, "min": 0.12, "max": 0.71},
-        "itl_ms_mean":  { ... },
+        "itl_ms_mean":  { ... },        # per-request, then summarized
+        "itl_ms_pooled": {              # every decode step of every request in one pool (#1)
+            "count": 51234, "mean": 11.8, "min": 0.9, "max": 612.0,
+            "p50": 11.2, "p90": 12.1, "p99": 24.6, "p995": 41.0, "p999": 180.2
+        },
+        "stalls": { ... },              # decode-stall accounting at stall_ms (#1); docs/itl-cache-metrics.md
         "tokens_out":   { ... },
         "tokens_per_s": { ... }
     },
+
+    # Optional blocks, each present only when the config asked for it:
+    "warmup_excluded": 16,              # warm-up requests recorded but excluded
+    "lanes":   {"deeprag": {...}, "sharegpt": {...}},      # per lane (mix / phases)
+    "phases":  {"warm": {...}, "revisit": {...}},          # per phase, same shape as the top level (#5)
+    "groups":  {"cache_class": {"device_hit": {...}, "restore": {...}, "miss": {...}}},  # group_by (#2)
+    "void":    {"void": false, "violations": [], "checks": [...]},  # void rules (#4)
+    "capability": {"start": {...}, "end": {...}},         # raw snapshots (#4)
 
     # Per-monitor time-series summaries (when configured):
     "monitors": {
@@ -125,10 +146,20 @@ One JSON object per line:
   "bytes_recv": 1024,
   "error": null,
   "workload": "openai-chat",
-  "meta": {"prompt_messages": [...], "max_tokens": 128, "finish_reason": "stop"},
-  "extra": {"ttft_s": 0.17, "itl_ms_mean": 25.3, "tokens_out": 64.0, "tokens_per_s": 32.1, "cached_tokens": 128.0}
+  "meta": {"prompt_messages": [...], "max_tokens": 128, "finish_reason": "stop",
+           "lane": "sharegpt", "phase": "revisit", "cache_class": "device_hit"},
+  "extra": {"ttft_s": 0.17, "ttft_token_index": 1.0, "itl_ms_mean": 25.3, "tokens_out": 64.0,
+            "tokens_per_s": 32.1, "cached_tokens": 128.0, "prompt_tokens_hint": 1024.0},
+  "series": {"itl_ms": [25.1, 25.0, 24.9, 180.2, ...]}
 }
 ```
+
+`meta.lane` / `meta.phase` come from `mix` / `phases`, `meta.cache_class`
+from the OpenAI workload-type's classifier, `meta.warmup: true` marks
+warm-up samples (absent otherwise), and any workload item's own `meta` dict (capacity tags, trace
+fields, dataset columns) is merged in. Numeric workload metrics and the
+`trace_*` fields are promoted to `extra`. `series` is only written with
+`dump_series: true`.
 
 ### `monitors.jsonl`
 

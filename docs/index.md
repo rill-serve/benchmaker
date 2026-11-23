@@ -59,6 +59,18 @@ A benchmark in benchmaker is the composition of four things:
 16. [AgentX](agentx.md) — the SemiAnalysis agentic-coding inference benchmark:
     WEKA trace replay with block-hash synthetic prompts, subagent DAGs, seeded
     warmup, and a profiling window.
+17. [Decode stalls, cache classes, TTFT parity](itl-cache-metrics.md) — pooled
+    ITL percentiles and stall accounting, `group_by: [cache_class]`, the TTFT
+    mix/latency decomposition, and what each arm's TTFT was stamped on.
+18. [Capability, manifest, void runs](capability-manifest.md) — server
+    self-description before/after a run, `manifest.json`, and `void_rules`.
+19. [Phases, warm-up, capacity-revisit](phases-capacity.md) — timed stages
+    with their own lanes, excluded warm-up, and the warm/revisit workload
+    for measuring a working set larger than the device cache.
+20. [Multi-arm comparisons](arms.md) — `benchmaker arms` / `compare`: ABBA
+    interleaving, per-rep bundles, same-job enforcement, the comparison table.
+21. [Replaying published traces](trace-replay.md) — Mooncake (block-hash
+    prefix structure) and Azure LLM inference traces with real arrival times.
 
 ## Where things live
 

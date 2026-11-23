@@ -57,14 +57,32 @@ class WorkloadType(ABC):
 
         Override to implement multi-step protocols (e.g. create → exec → delete).
         Use `ctx.fire(req)` to issue requests; it applies pre-hooks and uses
-        the shared httpx2 async client.
+        the shared httpx2 async client. Per-lane ``ctx.overrides`` are applied
+        by :meth:`apply_overrides` right after the request is built.
         """
         req = await self.make_request(ctx.item)
+        if ctx.overrides:
+            req = await maybe_await(self.apply_overrides(req, ctx.overrides))
         resp = await ctx.fire(req)
         sample = await self.make_sample(ctx.item, req, resp, ctx.start_mono)
         for hook in ctx.post_hooks:
             sample = await maybe_await(hook(req, resp, sample))
         return sample
+
+    def apply_overrides(self, req: Request, overrides: dict[str, Any]) -> Request:
+        """Apply per-lane request overrides (``TicketContext.overrides``).
+
+        The default handles ``{"model": ...}``: a JSON body gets its ``model``
+        field rewritten and the effective model is stamped into ``req.meta``
+        (and therefore ``Sample.meta``) as ``model``. Subclasses whose protocol
+        does not carry a model name override this to record the label only.
+        """
+        model = overrides.get("model")
+        if model:
+            if isinstance(req.json, dict):
+                req.json["model"] = model
+            req.meta["model"] = model
+        return req
 
     async def aclose(self) -> None:
         return None

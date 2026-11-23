@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 
 import click
@@ -143,6 +144,136 @@ def quick(url: str, method: str, header: tuple[str, ...], json_body: str | None,
     asyncio.run(runner.run())
     runner.metrics.render(sys.stdout)
     _write_bundle_if_requested(runner, cfg, out_dir, run_id, labels, notes)
+
+
+# ---------------------------------------------------------------- arms
+
+
+@main.command("arms")
+@click.argument("config_path", type=click.Path(exists=True, dir_okay=False))
+@click.option("--out-dir", type=click.Path(file_okay=False), required=True,
+              help="Parent directory for the run. Each (arm, rep) bundle goes to "
+                   "<out-dir>/<run-id>/arms/<arm>/rep-<k>/; the comparison table to "
+                   "<out-dir>/<run-id>/comparison.md.")
+@click.option("--run-id", default=None, help="Explicit run id (default: UTC timestamp).")
+@click.option("--label", "labels", multiple=True, help="'key=value' tag for every bundle. Repeatable.")
+@click.option("--notes", default="", help="Notes stored in every bundle's meta.json.")
+@click.option("--dotenv", type=click.Path(), default=".env", show_default=True,
+              help="Path to .env file to load. Use --dotenv '' to disable.")
+@click.option("--allow-mixed-jobs", is_flag=True, default=False,
+              help="Do not fail when reps come from different jobs/hosts (issue #3).")
+@click.option("--reps", type=int, default=None, help="Override arms.reps.")
+@click.option("--dry-run", "dry_run", is_flag=True, help="Print the execution plan and exit.")
+@click.option("--quiet", is_flag=True, help="Suppress progress output.")
+def arms(config_path: str, out_dir: str, run_id: str | None, labels: tuple[str, ...],
+         notes: str, dotenv: str, allow_mixed_jobs: bool, reps: int | None,
+         dry_run: bool, quiet: bool) -> None:
+    """Run a multi-arm comparison (ABBA / rep-major / random) from a YAML config.
+
+    The YAML holds the shared benchmark config plus an ``arms:`` block; see
+    ``benchmaker/core/arms.py``. Exit code 2 when reps came from different
+    jobs/hosts and --allow-mixed-jobs was not given.
+    """
+    from benchmaker.core.arms import ArmsRunner, plan_order
+    from benchmaker.core.compare import render_comparison, render_decomposition
+    from benchmaker.recipes._cli_shared import parse_labels
+
+    with open(config_path) as f:
+        raw_cfg = yaml.safe_load(f)
+    if reps is not None:
+        raw_cfg = {**raw_cfg, "arms": {**(raw_cfg.get("arms") or {}), "reps": reps}}
+
+    runner = ArmsRunner(raw_cfg, out_dir=out_dir, run_id=run_id,
+                        labels=parse_labels(labels), notes=notes,
+                        dotenv_path=(dotenv or None), quiet=quiet,
+                        allow_mixed_jobs=True if allow_mixed_jobs else None,
+                        progress=not quiet)
+    if dry_run:
+        s = runner.settings
+        plan = plan_order([a.name for a in s.arms], s.reps, s.order, s.seed)
+        for rep, arm in plan:
+            sys.stdout.write(f"{arm} rep-{rep}{' (warmup)' if rep < s.warmup_reps else ''}\n")
+        return
+
+    result = runner.run()
+    sys.stdout.write("\n" + render_comparison(result) + "\n")
+    for w in result.get("ttft_parity_warnings", []):
+        sys.stdout.write(f"\n⚠ TTFT parity: {w}\n")
+    for dec in result.get("decomposition", []):
+        sys.stdout.write("\n" + render_decomposition(dec, result["reference"], dec["arm"]) + "\n")
+    for v in result.get("same_job_violations", []):
+        sys.stderr.write(f"\n[benchmaker] same-job check: {v}\n")
+    if result.get("same_job_violations") and not runner.settings.allow_mixed_jobs:
+        sys.stderr.write("[benchmaker] refusing to merge results across jobs/hosts; "
+                         "re-run with --allow-mixed-jobs to accept.\n")
+        sys.exit(runner.exit_code(result))
+
+
+@main.command("compare")
+@click.argument("paths", nargs=-1, required=True, type=click.Path(exists=True, file_okay=False))
+@click.option("--reference", default=None, help="Reference arm (default: first).")
+@click.option("--metric", "metrics", multiple=True, help="Metric alias or dotted summary path. Repeatable.")
+@click.option("--warmup-reps", type=int, default=None, help="Override the number of warm-up reps to exclude.")
+@click.option("--allow-mixed-jobs", is_flag=True, default=False)
+@click.option("--format", "fmt", type=click.Choice(["md", "json"]), default="md", show_default=True)
+def compare(paths: tuple[str, ...], reference: str | None, metrics: tuple[str, ...],
+            warmup_reps: int | None, allow_mixed_jobs: bool, fmt: str) -> None:
+    """Compare finished arms: per-rep medians, min–max, ratios, same-job check,
+    TTFT parity and the TTFT mix/latency decomposition.
+
+    Each PATH is either an arms run root (``<run-id>/arms/<arm>/rep-<k>/``) or
+    a directory of such roots. Re-runs the comparison without new requests.
+    """
+    import json as _json
+
+    from benchmaker.core.arms import (
+        ArmsSettings, build_comparison, discover_arm_dirs, runs_from_arm_dirs,
+    )
+    from benchmaker.core.compare import render_comparison, render_decomposition
+
+    arm_dirs: dict[str, list[str]] = {}
+    roots: list[str] = []
+    for p in paths:
+        if os.path.isdir(os.path.join(p, "arms")):
+            roots.append(p)
+        else:
+            for sub in sorted(os.listdir(p)):
+                if os.path.isdir(os.path.join(p, sub, "arms")):
+                    roots.append(os.path.join(p, sub))
+    for root in roots:
+        for arm, dirs in discover_arm_dirs(root).items():
+            arm_dirs.setdefault(arm, []).extend(dirs)
+    if not arm_dirs:
+        raise click.UsageError("no arms found; expected <path>/arms/<arm>/rep-<k>/ bundles")
+    warm = warmup_reps if warmup_reps is not None else _detect_warmup(roots)
+    runs = runs_from_arm_dirs(arm_dirs, warmup_reps=warm)
+    settings = ArmsSettings(reference=reference, metrics=list(metrics) or None,
+                            allow_mixed_jobs=allow_mixed_jobs,
+                            warmup_reps=warm, reps=max(r.rep for r in runs) + 1)
+    result = build_comparison(runs, settings)
+    if fmt == "json":
+        sys.stdout.write(_json.dumps(result, indent=2, default=str) + "\n")
+        return
+    sys.stdout.write(render_comparison(result) + "\n")
+    for w in result.get("ttft_parity_warnings", []):
+        sys.stdout.write(f"\n⚠ TTFT parity: {w}\n")
+    for dec in result.get("decomposition", []):
+        sys.stdout.write("\n" + render_decomposition(dec, result["reference"], dec["arm"]) + "\n")
+    if result.get("same_job_violations"):
+        for v in result["same_job_violations"]:
+            sys.stderr.write(f"\n[benchmaker] same-job check: {v}\n")
+        if not allow_mixed_jobs:
+            sys.exit(2)
+
+
+def _detect_warmup(roots: list[str]) -> int:
+    for root in roots:
+        try:
+            with open(os.path.join(root, "plan.json")) as f:
+                return int(json.load(f).get("warmup_reps", 0))
+        except (OSError, ValueError):
+            continue
+    return 0
 
 
 # ---------------------------------------------------------------- collect

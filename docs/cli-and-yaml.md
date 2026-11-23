@@ -8,8 +8,9 @@ into two groups:
   chat), `sandbox` (Flash Sandbox), `swebench` (SWE-bench Verified eval),
   `sglang` (SGLang native `/generate`), `agentic` (prefix-cache
   parity), and `swebench-replay` (deterministic SWE-bench re-evaluation).
-- **Infra commands** — `run` (drive any benchmark from a YAML config file) and
-  `collect` (pivot many run-dirs into a table).
+- **Infra commands** — `run` (drive any benchmark from a YAML config file),
+  `arms` / `compare` (multi-arm A/B with interleaved reps and a comparison
+  table), and `collect` (pivot many run-dirs into a table).
 
 > `quick` is a deprecated alias for `http`; it still works but prints a warning.
 
@@ -329,6 +330,48 @@ Options:
 | `--replay-speed FLOAT`                        | Speed multiplier for `--replay` (default `1.0`; `2.0` = double speed). |
 | `--quiet`                                     | Suppress progress output                         |
 
+## `benchmaker arms`
+
+Run one YAML config against several servers ("arms"), several reps each,
+interleaved (ABBA / rep-major / random), writing one bundle per (arm, rep)
+and a comparison table. See [Multi-arm comparisons](arms.md) for the YAML
+`arms:` block and how to read the table.
+
+```bash
+benchmaker arms arms.yaml --out-dir ./runs --label gpus=8xh100
+benchmaker arms arms.yaml --out-dir ./runs --dry-run          # print the plan only
+benchmaker arms arms.yaml --out-dir ./runs --reps 2 --allow-mixed-jobs
+```
+
+| Flag                    | Meaning                                                        |
+| ----------------------- | -------------------------------------------------------------- |
+| `--out-dir DIR`         | Parent of `<run-id>/arms/<arm>/rep-<k>/` bundles (required)     |
+| `--run-id`, `--label`, `--notes`, `--dotenv`, `--quiet` | as for `run`                                    |
+| `--reps N`              | Override `arms.reps`                                           |
+| `--allow-mixed-jobs`    | Do not exit 2 when reps came from different jobs/hosts          |
+| `--dry-run`             | Print the `(arm, rep)` execution order and exit                 |
+
+Exit codes: `0` done; `2` same-job check violated and `--allow-mixed-jobs`
+not given (bundles and `comparison.*` are still written).
+
+## `benchmaker compare`
+
+Rebuild the comparison from finished arms bundles without any requests:
+
+```bash
+benchmaker compare ./runs/20260701T120000Z
+benchmaker compare ./runs --reference vllm --metric ttft_p99 --format json
+```
+
+| Flag                    | Meaning                                                        |
+| ----------------------- | -------------------------------------------------------------- |
+| `PATH...`               | Arms run roots (`<root>/arms/<arm>/rep-<k>/`) or dirs of them   |
+| `--reference ARM`       | Ratio baseline (default: the first arm in the plan)             |
+| `--metric ALIAS`        | Metric alias or dotted `summary.json` path; repeatable          |
+| `--warmup-reps N`       | Override the number of excluded reps (default: from `plan.json`) |
+| `--allow-mixed-jobs`    | Do not exit 2 on a same-job violation                           |
+| `--format md\|json`    | Table for humans / `comparison.json` on stdout                  |
+
 ## `benchmaker collect`
 
 Pivot one or more run bundles into a comparison table on stdout:
@@ -388,6 +431,28 @@ mix:
       workload: {type: jsonl, path: .local/sharegpt_v3.jsonl}
       rate: sweep:8,2,8,2@60s
 
+# ---------- phases (alternative to workload+load and mix; docs/phases-capacity.md) ----------
+# Timed stages run back-to-back, each with its own lanes; samples get meta.phase.
+phases:
+  - name: warm
+    duration: 120s
+    lanes:
+      - name: warm
+        workload: {type: capacity, n_docs: 64, doc_tokens: 8192, stage: warm}
+        rate: 4
+  - name: revisit
+    duration: 120s
+    drain: true                      # let in-flight requests finish before the next phase
+    lanes:
+      - name: revisit
+        workload: {type: capacity, n_docs: 64, doc_tokens: 8192, stage: revisit}
+        rate: 4
+      - name: background
+        workload: {type: jsonl, path: .local/sharegpt_v3.jsonl, loop: true}
+        rate: poisson:6
+        model: other-model            # route this lane to another model on the endpoint
+        meta: {tier: background}      # extra tags stamped on every sample of the lane
+
 # ---------- hooks (optional) ----------
 pre_hooks:
   - my_pkg.hooks:sign_request
@@ -422,6 +487,24 @@ replay:
   speed: 1.0                         # speed multiplier (2.0 = twice as fast)
   streaming: false                   # match the original workload-type's streaming flag
 
+# ---------- measurement knobs (all optional; docs/itl-cache-metrics.md) ----------
+warmup_requests: 16                  # first N requests are warm-up: recorded, excluded from summaries
+warmup_s: 5s                         #   ... or everything fired in the first 5 s
+group_by: [cache_class, visit]       # break the summary (and every lane/phase) down by meta keys
+stall_ms: 12                         # inter-token gap above this is a decode stall ("none" disables)
+dump_series: false                   # write every sample's raw per-token series into samples.jsonl
+
+# ---------- capability & void rules (optional; docs/capability-manifest.md) ----------
+capability:
+  url: http://localhost:8000/v1/models   # fetched before and after the run
+  headers: {Authorization: "Bearer ${API_KEY}"}
+  timeout_s: 10
+void_rules:
+  - {name: served-model, path: models.0, op: eq, value: qwen2.5-32b, at: both}
+  - {name: no-fallback, path: fallbacks, op: empty}
+model_revision: v1.2.3               # manifest: override the served-model revision
+record_env: [MY_SERVER_*]            # manifest: extra env globs to record
+
 # ---------- runner knobs (all optional) ----------
 connection_limit: 1000               # aiohttp TCPConnector limit
 timeout_s: 60                        # global default per-request timeout
@@ -454,6 +537,13 @@ progress_every_s: 1.0                # 0 disables progress output
   multi-passage QA JSONL. See [DeepRAG and mixed lanes](deeprag-mix.md).
 - `agentic` — `AgenticWorkload(...)`. Expand multi-turn trajectories
   into per-turn items. See [Agentic](agentic.md).
+- `capacity` (or `capacity-revisit`) — `CapacityRevisitWorkload(...)`: warm
+  pass over N long documents then revisit passes, tagged per visit. See
+  [Phases & capacity](phases-capacity.md).
+- `mooncake-trace` / `azure-trace` / `trace-replay` (auto-detect) —
+  published serving traces with real arrival times and (Mooncake) block-hash
+  prefix structure. Pair with `load: {type: trace}`. See
+  [Replaying published traces](trace-replay.md).
 - `factory: 'module:fn'` — call `fn(**kwargs)`; must return a `Workload`.
 
 You can also write a workload as bare YAML for two shortcuts:
@@ -476,6 +566,7 @@ load: closed:32
 load: ramp:10..500:30s
 load: ramp-poisson:10..500:30s
 load: sweep:10,50,100,500@30s
+load: {type: trace, speed: 1.0}     # trace replay: each item at its own arrival time
 ```
 
 Equivalent dict form, when you want more knobs:

@@ -39,6 +39,39 @@ class Workload(ABC):
     async def aclose(self) -> None:
         return None
 
+    # -- provenance (issue #4) -------------------------------------------
+    def content_hash(self) -> Optional[str]:
+        """``sha256:<hex>`` of the exact items this workload yields, or ``None``
+        when the set cannot be known up front (streaming/callable sources).
+
+        Two runs with the same content hash replayed the same inputs, which is
+        what makes their results comparable; the run manifest records it next
+        to the config hash.
+        """
+        return None
+
+    def item_count(self) -> Optional[int]:
+        """Number of items the workload can yield, if known."""
+        return None
+
+
+def _hash_items(items: list) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for it in items:
+        h.update(json.dumps(it, sort_keys=True, default=str).encode("utf-8", errors="replace"))
+        h.update(b"\n")
+    return "sha256:" + h.hexdigest()
+
+
+def _hash_file(path: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
+
 
 class StaticWorkload(Workload):
     """Cycle through a fixed list of items forever (or `max_items` times).
@@ -61,6 +94,12 @@ class StaticWorkload(Workload):
         self._cycle = itertools.cycle(items)
         self._max = max_items
         self._n = 0
+
+    def content_hash(self) -> Optional[str]:
+        return _hash_items(self._items)
+
+    def item_count(self) -> Optional[int]:
+        return self._max if self._max is not None else None
 
     async def next_item(self) -> Any:
         if self._max is not None and self._n >= self._max:
@@ -91,6 +130,15 @@ class JsonlWorkload(Workload):
         self._n = 0
         self._fh = open(path, "r")
         self._lock = asyncio.Lock()
+        self._file_hash: Optional[str] = None
+
+    def content_hash(self) -> Optional[str]:
+        if self._file_hash is None:
+            self._file_hash = _hash_file(self._path)
+        return self._file_hash
+
+    def item_count(self) -> Optional[int]:
+        return self._max
 
     async def next_item(self) -> Any:
         if self._max is not None and self._n >= self._max:
@@ -151,6 +199,12 @@ class IterableWorkload(Workload):
             self._items_cache = list(iterable)  # type: ignore[arg-type]
             self._iter = iter(self._items_cache)
             self._is_async = False
+
+    def content_hash(self) -> Optional[str]:
+        return _hash_items(self._items_cache) if self._items_cache is not None else None
+
+    def item_count(self) -> Optional[int]:
+        return len(self._items_cache) if self._items_cache is not None else None
 
     async def next_item(self) -> Any:
         if self._is_async:

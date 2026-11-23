@@ -17,6 +17,8 @@ from benchmaker import (
     read_bundle,
 )
 from benchmaker.io.bundle import (
+    BUNDLE_VERSION,
+    MANIFEST_FILENAME,
     META_FILENAME,
     SUMMARY_FILENAME,
     SAMPLES_FILENAME,
@@ -57,13 +59,25 @@ async def test_write_bundle_creates_all_files(stub_server: str, tmp_path):
     assert meta["workload"] == "static"
     assert meta["labels"] == {"variant": "baseline"}
     assert meta["notes"] == "smoke"
-    assert meta["bundle_version"] == 1
+    assert meta["bundle_version"] == BUNDLE_VERSION
     assert meta["started_at"].endswith("+00:00")
     assert meta["ended_at"].endswith("+00:00")
     assert meta["wall_time_s"] > 0
+    # No void rules configured -> no verdict.
+    assert meta["void"] is None
 
     summary = json.loads((out_dir / "run-a" / SUMMARY_FILENAME).read_text())
     assert summary["total_requests"] >= 1
+
+    # Every bundle carries a manifest (#4): config hash, prompt-set hash,
+    # host/job identity.
+    manifest = json.loads((out_dir / "run-a" / MANIFEST_FILENAME).read_text())
+    assert manifest["config_hash"].startswith("sha256:")
+    assert manifest["run_id"] == "run-a"
+    assert manifest["model"]["id"] is None  # http workload-type has no model
+    assert manifest["host"]["hostname"]
+    assert manifest["host"]["job_id"]
+    assert manifest["prompt_set"]["name"] == "static"
 
     # samples.jsonl: one decodable record per line.
     with open(out_dir / "run-a" / SAMPLES_FILENAME) as f:

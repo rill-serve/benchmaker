@@ -20,9 +20,10 @@ import importlib
 from typing import Any, Callable, Optional
 
 from benchmaker.env import interpolate, load_dotenv
-from benchmaker.core.load import parse_duration, parse_rate_spec
+from benchmaker.core.capability import parse_void_rules
+from benchmaker.core.load import TraceArrivalsLoad, parse_duration, parse_rate_spec
 from benchmaker.core.monitors import FunctionMonitor, Monitor, PrometheusMonitor
-from benchmaker.core.runner import BenchConfig, BenchLane
+from benchmaker.core.runner import BenchConfig, BenchLane, BenchPhase
 from benchmaker.workloads.base import WorkloadType
 from benchmaker.workloads.datasets import (
     CallableWorkload,
@@ -33,6 +34,8 @@ from benchmaker.workloads.datasets import (
 from benchmaker.workloads.hf import HFDatasetWorkload
 from benchmaker.workloads.rag import DeepRAGWorkload
 from benchmaker.workloads.tracelab import TraceLabWorkload
+from benchmaker.workloads.traces import trace_replay_from_spec
+from benchmaker.workloads.capacity import CapacityRevisitWorkload
 from benchmaker.workloads.http import HttpWorkloadType
 from benchmaker.workloads.llm import OpenAIChatWorkloadType
 from benchmaker.workloads.sandbox import SandboxWorkloadType
@@ -160,6 +163,15 @@ def build_workload(spec: Any) -> Workload:
         return DeepRAGWorkload(**kwargs)
     if t in ("tracelab", "trace-lab", "trace"):
         return TraceLabWorkload(**kwargs)
+    # Published serving-trace replay (issue #6): Mooncake (block hashes) / Azure.
+    if t in ("mooncake", "mooncake-trace", "mooncake_trace"):
+        return trace_replay_from_spec({"path": kwargs.pop("path"), "source": "mooncake", **kwargs})
+    if t in ("azure", "azure-trace", "azure_trace", "azure-llm"):
+        return trace_replay_from_spec({"path": kwargs.pop("path"), "source": "azure", **kwargs})
+    if t in ("trace-replay", "serving-trace", "serving_trace"):
+        return trace_replay_from_spec({"source": "auto", **kwargs})
+    if t in ("capacity", "capacity-revisit", "capacity_revisit"):
+        return CapacityRevisitWorkload(**kwargs)
     if t == "agentic":
         from benchmaker.workloads.agentic import AgenticWorkload
         return AgenticWorkload(**kwargs)
@@ -375,8 +387,12 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
 
     replay_spec = cfg.get("replay")
     mix_spec = cfg.get("mix")
+    phases_spec = cfg.get("phases")
     if replay_spec is not None and mix_spec is not None:
         raise ValueError("'replay' and 'mix' are mutually exclusive")
+    if phases_spec and (replay_spec is not None or mix_spec is not None):
+        raise ValueError("'phases' cannot be combined with 'replay' or 'mix'")
+    phases: list[BenchPhase] = []
     if replay_spec is not None:
         workload_type, workload, load_model = _build_replay(replay_spec)
         lanes: list[BenchLane] = []
@@ -408,13 +424,26 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
                 duration_s=duration,
                 max_requests=cfg.get("max_requests"),
             )
+        elif phases_spec:
+            # Phased configs carry their lanes per phase (issue #5); the
+            # top-level workload is a placeholder.
+            if cfg.get("load") is not None:
+                raise ValueError("a phased config cannot also define top-level 'load'")
+            workload = StaticWorkload()
+            load_model = None
+            lanes = []
         else:
             workload = build_workload(cfg.get("workload"))
             load_spec = cfg.get("load")
             if load_spec is None:
                 raise ValueError("config must define 'load' or 'mix.lanes'")
-            load_model = parse_rate_spec(load_spec, duration_s=duration,
-                                         max_requests=cfg.get("max_requests"))
+            load_model = _build_load(load_spec, workload, duration_s=duration,
+                                     max_requests=cfg.get("max_requests"))
+            lanes = []
+        phases = _build_phases(phases_spec, duration_s=duration,
+                               max_requests=cfg.get("max_requests"))
+        if phases:
+            load_model = None
             lanes = []
 
     pre_hooks = [resolve_callable(h) for h in (cfg.get("pre_hooks") or [])]
@@ -442,6 +471,7 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
 
     recorder = _build_recorder(cfg.get("record"))
 
+    stall_ms = cfg.get("stall_ms", cfg.get("stall_threshold_ms"))
     return BenchConfig(
         workload_type=workload_type,
         workload=workload,
@@ -456,7 +486,69 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
         max_in_flight=int(cfg.get("max_in_flight", 10000)),
         progress_every_s=float(cfg.get("progress_every_s", 1.0)),
         stop_on_exhausted=bool(cfg.get("stop_on_exhausted", True)),
+        stall_ms=None if stall_ms in (None, "none", "off", False) else float(stall_ms),
+        dump_series=bool(cfg.get("dump_series", False)),
+        group_by=[str(k) for k in (cfg.get("group_by") or [])],
+        warmup_requests=int(cfg.get("warmup_requests", 0)),
+        warmup_s=float(_opt_duration(cfg.get("warmup_s", cfg.get("warmup", 0.0)))),
+        phases=phases,
+        capability=cfg.get("capability") or None,
+        void_rules=parse_void_rules(cfg.get("void_rules")),
+        model_revision=(str(cfg["model_revision"]) if cfg.get("model_revision") else None),
+        record_env=[str(k) for k in (cfg.get("record_env") or [])],
     )
+
+
+def _opt_duration(v) -> Optional[float]:
+    if v is None:
+        return None
+    return parse_duration(v) if isinstance(v, str) else float(v)
+
+
+def _build_load(load_spec: Any, workload: Workload, *, duration_s: Optional[float],
+                max_requests: Optional[int]) -> Any:
+    """``load: {type: trace}`` takes its arrival times from the workload
+    (a trace-replay workload exposes ``arrival_times``); everything else goes
+    through `parse_rate_spec`."""
+    if isinstance(load_spec, dict) and str(load_spec.get("type", "")).lower() in ("trace", "trace-arrivals", "arrivals"):
+        times = getattr(workload, "arrival_times", None)
+        if times is None:
+            raise ValueError("load type 'trace' needs a workload with arrival_times (trace-replay)")
+        spec = {k: v for k, v in load_spec.items() if k != "type"}
+        return TraceArrivalsLoad(
+            times, speed=float(spec.get("speed", 1.0)),
+            max_requests=spec.get("max_requests", max_requests),
+        )
+    return parse_rate_spec(load_spec, duration_s=duration_s, max_requests=max_requests)
+
+
+def _build_phases(spec: Any, *, duration_s: Optional[float],
+                  max_requests: Optional[int]) -> list[BenchPhase]:
+    """Build ``phases:`` (issue #5): timed stages, each with its own lanes.
+
+    ``phases: [{name, duration, lanes: [{name, workload, rate, model?, meta?}]}]``
+    """
+    if not spec:
+        return []
+    if not isinstance(spec, list):
+        raise TypeError("'phases' must be a list")
+    phases = []
+    for i, ph in enumerate(spec):
+        if not isinstance(ph, dict) or not ph.get("name"):
+            raise ValueError(f"phases[{i}] must be a mapping with a name")
+        dur = ph.get("duration", duration_s)
+        if dur is None:
+            raise ValueError(f"phase {ph['name']!r} needs a duration")
+        dur = parse_duration(dur) if isinstance(dur, str) else float(dur)
+        phase_lanes = _build_lanes({"lanes": ph.get("lanes")}, duration_s=dur, max_requests=max_requests)
+        # Lane-level model/meta overrides (multi-model phases).
+        for lane, lspec in zip(phase_lanes, ph.get("lanes") or []):
+            if isinstance(lspec, dict):
+                lane.model = lspec.get("model")
+                lane.meta = {**lane.meta, **(lspec.get("meta") or {}), "phase": ph["name"]}
+        phases.append(BenchPhase(name=ph["name"], lanes=phase_lanes, duration_s=dur,
+                                 drain=bool(ph.get("drain", False))))
+    return phases
 
 
 def _build_lanes(spec: Any, *, duration_s: Optional[float],
@@ -485,14 +577,17 @@ def _build_lanes(spec: Any, *, duration_s: Optional[float],
         if isinstance(lane_duration, str):
             lane_duration = parse_duration(lane_duration)
         lane_max_requests = lane_spec.get("max_requests", max_requests)
+        lane_workload = build_workload(lane_spec["workload"])
+        # ``model`` routes the lane at another model behind the same endpoint
+        # (multi-arm / multi-model phase, issues #3 and #5); ``meta`` is stamped
+        # onto every sample of the lane (arm, phase label, ...).
         lanes.append(BenchLane(
             name=name,
-            workload=build_workload(lane_spec["workload"]),
-            load=parse_rate_spec(
-                rate,
-                duration_s=lane_duration,
-                max_requests=lane_max_requests,
-            ),
+            workload=lane_workload,
+            load=_build_load(rate, lane_workload, duration_s=lane_duration,
+                             max_requests=lane_max_requests),
+            model=lane_spec.get("model"),
+            meta=dict(lane_spec.get("meta") or {}),
         ))
     return lanes
 
