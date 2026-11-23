@@ -46,7 +46,7 @@ asyncio.run(main())
 
 Or via the CLI. Workload-specific benchmarks are exposed as **recipes** —
 `benchmaker <recipe> --args` (`http`, `llm`, `sandbox`, `swebench`,
-`swebench-replay`, `sglang`, `agentic`, `pareval`, `tracelab`):
+`swebench-replay`, `sglang`, `agentic`, `session-replay`, `pareval`, `tracelab`):
 
 ```bash
 benchmaker http --url https://httpbin.org/get --rate poisson:50 --duration 10s
@@ -161,6 +161,7 @@ Full docs live in [`docs/`](docs/):
 - [TraceLab benchmark](docs/tracelab.md) — replay real coding-agent (Claude/Codex) token + prefix-cache distributions
 - [SGLang benchmark](docs/sglang.md) — native SGLang `/generate` benchmark
 - [Agentic](docs/agentic.md) — multi-turn prefix-cache parity replay
+- [Session replay](docs/session-replay.md) — prepared multi-turn session files with turn dependencies and a prompt-set hash
 - [Decode stalls, cache classes, TTFT parity](docs/itl-cache-metrics.md) —
   pooled ITL percentiles, stall accounting, per-cache-class summaries and the
   TTFT mix/latency decomposition

@@ -71,6 +71,8 @@ A benchmark in benchmaker is the composition of four things:
     interleaving, per-rep bundles, same-job enforcement, the comparison table.
 21. [Replaying published traces](trace-replay.md) — Mooncake (block-hash
     prefix structure) and Azure LLM inference traces with real arrival times.
+22. [Session replay](session-replay.md) — prepared multi-turn session files: per-session turn
+    dependencies, prompt-set hash, recorded-output pinning, chat-template check.
 
 ## Where things live
 
