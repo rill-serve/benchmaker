@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Session replay (#10):** the `session-replay` recipe and workload type run a
+  prepared session file (manifest + one row per request): each session's turn
+  k+1 goes out only after turn k completed plus a think time (row
+  `after.think_s`, or a lognormal `median * exp(sigma * think_z)` whose median
+  `--think-median-s` overrides), with closed-loop (`--concurrent-sessions`),
+  Poisson (`--session-rate`) or trace-timed (`--trace-scale`) session starts.
+  The prompt set is re-hashed on load (`prompt_set_sha256`), recorded output
+  lengths are pinned (`min_tokens = max_tokens`, `ignore_eos`), `warmup` rows
+  are excluded from summaries, and `--template-check` refuses a server whose
+  prompt-token count for the manifest's probe conversation differs from the
+  prepared one.
 - **Several endpoints per run (#8):** `endpoints: {model: url | {url,
   capability, headers}}` routes each request by its body `model` (a lane's
   `model:` or a workload item's) to its own server; samples are stamped

@@ -75,6 +75,8 @@ A benchmark in benchmaker is the composition of four things:
 21. [Replaying published traces](trace-replay.md) — Mooncake (block-hash
     prefix structure; `send: token_ids` bypasses the tokenizer) and Azure
     LLM inference traces with real arrival times.
+22. [Session replay](session-replay.md) — prepared multi-turn session files: per-session turn
+    dependencies, prompt-set hash, recorded-output pinning, chat-template check.
 
 ## Where things live
 

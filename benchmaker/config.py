@@ -175,6 +175,9 @@ def build_workload(spec: Any) -> Workload:
         return trace_replay_from_spec({"source": "auto", **kwargs})
     if t in ("capacity", "capacity-revisit", "capacity_revisit"):
         return CapacityRevisitWorkload(**kwargs)
+    if t in ("session-replay", "session_replay"):
+        from benchmaker.workloads.session_replay import ReplayWorkload
+        return ReplayWorkload(**kwargs)
     if t == "agentic":
         from benchmaker.workloads.agentic import AgenticWorkload
         return AgenticWorkload(**kwargs)
