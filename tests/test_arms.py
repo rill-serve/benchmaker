@@ -280,6 +280,8 @@ async def test_arms_runner_end_to_end(openai_stub: str, tmp_path, monkeypatch):
             assert (d / "summary.json").is_file() and (d / "manifest.json").is_file()
             assert (d / "capability.start.json").is_file() and (d / "capability.end.json").is_file()
     assert result["reference"] == "fast" and result["reps"] == 2 and result["warmup_reps"] == 1
+    assert result["signoff"] == {"passed": 2, "void": 0, "failed": 0, "warmup": 2}
+    assert "VOID" not in (root / "comparison.md").read_text()
     assert result["arms"]["fast"]["reps"] == 1 and result["arms"]["slow"]["reps"] == 1  # warm-up excluded
     assert result["arms"]["slow"]["metrics"]["ttft_p50"]["ratio_vs_ref"] > 1.0
     assert result["arms"]["slow"]["metrics"]["ttft_p50"]["better_than_ref"] is False
@@ -353,6 +355,7 @@ async def test_arms_cli_dry_run_and_compare(openai_stub, tmp_path, monkeypatch):
                                                    "--run-id", "e2e", "--quiet", "--label", "env=ci"])
     assert r.exit_code == 0, r.output
     assert "| **a** | 2 |" in r.output and "| b | 2 |" in r.output
+    assert "VOID" not in r.output
     assert "✓" not in r.output or "✗" in r.output  # slow arm can't be better on ttft
 
     r = cli.invoke(main, ["compare", str(out), "--metric", "ttft_mean"])
@@ -368,3 +371,29 @@ async def test_arms_cli_dry_run_and_compare(openai_stub, tmp_path, monkeypatch):
     assert r.exit_code == 2 and "different jobs/hosts" in r.output
     r = cli.invoke(main, ["compare", str(out / "e2e"), "--allow-mixed-jobs", "--format", "json"])
     assert r.exit_code == 0 and json.loads(r.output)["same_job_violations"]
+
+
+def test_arms_cli_fails_when_every_measured_rep_failed_or_was_void(tmp_path):
+    from click.testing import CliRunner
+
+    from benchmaker.cli import main
+
+    cfg = {
+        "workload_type": {"type": "http", "url": "http://127.0.0.1:9/nope"},
+        "load": "closed:1", "max_requests": 1,
+        "arms": {"reps": 1, "arms": {
+            "failed": {},
+            "void": {"config": {
+                "capability": {"url": "http://127.0.0.1:9/nope"},
+                "void_rules": [{"name": "up", "path": "model", "op": "ne", "value": None}],
+            }},
+        }},
+    }
+    path = tmp_path / "arms.yaml"
+    path.write_text(json.dumps(cfg))
+    result = CliRunner().invoke(main, ["arms", str(path), "--out-dir", str(tmp_path),
+                                       "--run-id", "run", "--quiet"])
+    assert result.exit_code == 1, result.output
+    assert "no measured repetitions passed" in result.output
+    comparison = json.loads((tmp_path / "run" / "comparison.json").read_text())
+    assert comparison["signoff"] == {"passed": 0, "void": 1, "failed": 1, "warmup": 0}

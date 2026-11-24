@@ -46,14 +46,24 @@ Session starts, exactly one of:
 `--think-median-s` overrides the manifest's median, so one prompt set (one hash) serves a whole think-time sweep.
 Turns within a session always keep their dependency.
 
+Use `--sessions-per-model N` (`sessions_per_model: N` in YAML) to keep up to N whole
+sessions per model, in their first-appearance order, including warm-up turns. The
+run manifest records the selected rows' prompt-set hash and item count. Its
+`prompt_set.provenance` includes the original prompt-set hash (`source_sha256`),
+the session limit, and the selected session and turn counts.
+
+The run summary records planned and successfully completed counts for measured and
+warm-up turns. A mismatch marks the run void, including when a request or
+duration cap cuts the replay short or a turn fails. The duration caps admissions
+while requests already sent still drain. The CLI exits with code 3 for a void
+standalone run. An arms run exits nonzero when no measured repetition passed.
+
 Sessions are admitted in `at_s` order whatever order the file lists them in:
 admission walks the list and stops at the first session whose time has not
 come, so a file that was not sorted would otherwise have held back every
 session behind a late one (issue #16). A turn that raises — `make_request`
 refusing a row, a `RoutingError`, a hook failing — is recorded as a failed
-sample *through the post-hooks*, so the session's slot is released and the
-next turn (and the next session) proceed; before #16 such a turn left the
-session wedged until the load model's time limit.
+sample and the session's slot is released, so its next turn can proceed.
 
 Routing (issue #15): with an `endpoints:` map, each row's `model` label
 selects its server; every label in the (filtered) file must have an
@@ -73,7 +83,7 @@ workload_type: {type: openai, url: http://host:8000/v1/chat/completions, model: 
 load: closed:8
 ```
 
-The workload's completion hook (which releases each session's next turn) is installed automatically. Rows with
+The runner releases each session's next turn automatically. Rows with
 `prompt_ids` instead of `messages` are refused here: send them with
 `workload_type: {type: openai-completions, ...}` (see
 [trace replay](trace-replay.md#send-token_ids-bypass-the-tokenizer-11)).

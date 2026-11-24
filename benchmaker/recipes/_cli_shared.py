@@ -48,20 +48,16 @@ def parse_headers(items: tuple[str, ...]) -> dict[str, str]:
 def write_bundle_if_requested(runner, source_config: dict,
                               out_dir: str | None, run_id: str | None,
                               labels: tuple[str, ...], notes: str) -> None:
-    if not out_dir:
-        return
-    path = runner.write_bundle(
-        out_dir,
-        run_id=run_id,
-        source_config=source_config,
-        labels=parse_labels(labels),
-        notes=notes,
-    )
-    sys.stderr.write(f"[benchmaker] wrote bundle to {path}\n")
+    if out_dir:
+        path = runner.write_bundle(
+            out_dir,
+            run_id=run_id,
+            source_config=source_config,
+            labels=parse_labels(labels),
+            notes=notes,
+        )
+        sys.stderr.write(f"[benchmaker] wrote bundle to {path}\n")
     if runner.is_void():
-        for v in runner.metrics.summary().get("void", {}).get("violations", []):
-            sys.stderr.write(f"[benchmaker] VOID: rule {v['rule']!r} at {v['at']}: "
-                             f"{v['path']} {v['op']} {v['expected']!r} -> {v['actual']!r} ({v['reason']})\n")
-        sys.stderr.write("[benchmaker] run is VOID (a void rule was violated); "
-                         "bundle written, exiting 3\n")
+        for v in runner.void_verdict()["violations"]:
+            sys.stderr.write(f"[benchmaker] VOID: {v['rule']}: {v['reason']}\n")
         sys.exit(3)

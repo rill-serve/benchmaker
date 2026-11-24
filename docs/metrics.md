@@ -255,3 +255,17 @@ runner.metrics.render(sys.stdout)
 
 Plain-text output, no dependencies. Sections appear in this order:
 throughput → latency → status codes → errors → workload metrics → monitors.
+
+### Closed-loop replay throughput
+
+The `closed_loop` block for closed-loop session replay reports mean configured
+think time per turn (zero for a session's first turn), mean service time, and
+estimated offered load in requests per second (session slots divided by the
+sum of those means, summed across parallel lanes). Estimated utilisation is the fraction of the measured
+window covered by at least one in-flight request. This includes network and
+server queueing time. The summary also gives an estimate per endpoint.
+
+With positive mean think time, throughput is flagged `loop_bound` when estimated
+utilisation is below 50% on every endpoint or the estimated offered rate is within 5% of the
+measured rate relative to offered load. Comparison tables flag these rates and
+show cache hit rate and TTFT p50 by cache class when available.

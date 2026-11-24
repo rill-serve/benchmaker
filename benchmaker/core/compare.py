@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import statistics
 from dataclasses import dataclass, field
+from itertools import combinations
 from typing import Any, Iterable, Optional
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,15 @@ DEFAULT_METRICS = [
     "ttft_p50", "ttft_p99", "itl_p99", "itl_p99.5", "stalls_per_req",
     "stall_excess_ms", "rps", "err_pct",
 ]
+
+_ALLOCATION_COLUMNS = {
+    "device_kv_tokens": "device KV tokens",
+    "host_tier_bytes": "host bytes",
+    "host_tier_tokens": "host KV tokens",
+    "bytes_per_token": "host bytes/token",
+    "sharing": "host sharing",
+}
+FLEET_HOST_TOLERANCE = 0.05
 
 # Metrics reported as percentages (value 0..1 -> 0..100).
 _PCT_METRICS = {"err_pct", "req_fail_pct", "cached_pct"}
@@ -226,22 +236,91 @@ def compare(runs: list[RunRef], metrics: Optional[list[str]] = None,
             }
         table[arm] = ArmStats(arm=arm, reps=len(by_arm[arm]), metrics=stats)
 
+    loop_bound = {
+        arm: [r.summary["closed_loop"] for r in by_arm[arm]
+              if (r.summary.get("closed_loop") or {}).get("loop_bound")]
+        for arm in arms
+    }
+    loop_bound = {arm: reps for arm, reps in loop_bound.items() if reps}
     for arm in arms:
         for m, st in table[arm].metrics.items():
             ref_st = table[ref].metrics.get(m) or {}
             ratio = None
             if "median" in st and "median" in ref_st and ref_st["median"] != 0:
                 ratio = st["median"] / ref_st["median"]
+            if st["path"] in {"throughput_rps", "goodput_rps"} and (arm in loop_bound or ref in loop_bound):
+                ratio = None
             st["ratio_vs_ref"] = ratio
             st["better_than_ref"] = _better(st, ref_st, ratio)
 
+    allocations = {arm: [_run_allocation(run) for run in by_arm[arm]] for arm in arms}
     return {
         "metrics": metrics,
         "reference": ref,
-        "arms": {a: table[a].to_dict() for a in arms},
+        "arms": {a: {**table[a].to_dict(), "allocations": allocations[a]} for a in arms},
+        "allocation_warnings": _allocation_warnings(allocations),
+        "cache_restores": {
+            arm: [{"rep": r.rep, "sources": r.summary.get("cache_restores", {})} for r in by_arm[arm]]
+            for arm in arms
+        },
         "excluded": excluded,
+        "loop_bound": loop_bound,
         "void": {r.arm: r.is_void() for r in runs if r.is_void()},
     }
+
+
+def _run_allocation(run: RunRef) -> dict:
+    manifest = run.manifest or {}
+    return {
+        "rep": run.rep,
+        "arm": manifest.get("allocation") or {},
+        "endpoints": {
+            name: endpoint.get("allocation") or {}
+            for name, endpoint in (manifest.get("endpoints") or {}).items()
+        },
+    }
+
+
+def _allocation_warnings(allocations: dict[str, list[dict]]) -> list[str]:
+    totals = {
+        arm: sorted({
+            rep["arm"]["fleet_host_total_bytes"]
+            for rep in reps if rep["arm"].get("fleet_host_total_bytes") is not None
+        })
+        for arm, reps in allocations.items()
+    }
+    totals = {arm: values for arm, values in totals.items() if values}
+    for left, right in combinations(totals.values(), 2):
+        if (right[-1] - left[0] > FLEET_HOST_TOLERANCE * right[-1]
+                or left[-1] - right[0] > FLEET_HOST_TOLERANCE * left[-1]):
+            detail = ", ".join(f"{name}={_format_alloc(vals)}" for name, vals in totals.items())
+            return [f"Fleet host KV budgets differ by more than {FLEET_HOST_TOLERANCE:.0%} ({detail} bytes)."]
+    return []
+
+
+def _format_alloc(values: Iterable[Any]) -> str:
+    return " / ".join(dict.fromkeys(
+        "—" if v is None else f"{v:,}" if isinstance(v, int) else f"{v:,.2f}"
+        if isinstance(v, float) else str(v).replace("|", "\\|")
+        for v in values
+    )) or "—"
+
+
+def _allocation_cells(reps: list[dict]) -> list[str]:
+    names = sorted({name for rep in reps for name in rep["endpoints"]})
+    cells = []
+    for key in _ALLOCATION_COLUMNS:
+        if names:
+            cell = "<br>".join(
+                _format_alloc([name]) + " "
+                + _format_alloc(rep["endpoints"].get(name, {}).get(key) for rep in reps)
+                for name in names
+            )
+        else:
+            cell = _format_alloc(rep["arm"].get(key) for rep in reps)
+        cells.append(cell)
+    cells.append(_format_alloc(rep["arm"].get("fleet_host_total_bytes") for rep in reps))
+    return cells
 
 
 def _better(st: dict, ref_st: dict, ratio: Optional[float]) -> Optional[bool]:
@@ -257,12 +336,48 @@ def format_value(name: str, v: Optional[float]) -> str:
     return _fmt(name, v)
 
 
+def _render_cache_restores(reps_by_arm: dict, order: list[str]) -> list[str]:
+    if not any(rep["sources"] for reps in reps_by_arm.values() for rep in reps):
+        return []
+    lines = [
+        "", "### Host-tier KV restores", "",
+        "| arm | rep | monitor | engine | restored share of prompt tokens | restored bytes | attribution |",
+        "|---|---:|---|---|---:|---:|---|",
+    ]
+    for arm in order:
+        for rep in reps_by_arm.get(arm) or [{"rep": "—", "sources": {}}]:
+            sources = rep["sources"] or {"—": {"reason": "no restore telemetry"}}
+            for source, report in sources.items():
+                share = report.get("restored_token_share")
+                restored_bytes = report.get("restored_bytes")
+                status = report.get("attribution", "unavailable")
+                if report.get("reason"):
+                    status += f" ({report['reason']})"
+                if report.get("scope"):
+                    status += f", {report['scope']}"
+                byte_display = f"{restored_bytes:,.0f}" if restored_bytes is not None else "unavailable"
+                if report.get("restored_bytes_source") == "estimated from tokens":
+                    byte_display += " (estimate)"
+                share_display = f"{share:.2%}" if share is not None else "unavailable"
+                if share is not None and report.get("restored_token_estimate"):
+                    share_display += f" ({report['restored_token_estimate']})"
+                cells = [
+                    arm, str(rep["rep"]), source, report.get("engine", "—"),
+                    share_display, byte_display, status,
+                ]
+                lines.append("| " + " | ".join(cell.replace("|", "\\|") for cell in cells) + " |")
+    return lines
+
+
 def render_comparison(result: dict, *, ref: Optional[str] = None) -> str:
     """Markdown table: one row per arm, ``median [min–max] (×ref)`` per metric."""
     ref = ref or result["reference"]
     metrics = result["metrics"]
     arms = result["arms"]
+    show_allocation = any(rep["arm"] for arm in arms.values() for rep in arm.get("allocations", []))
     head = ["arm", "reps"] + metrics
+    if show_allocation:
+        head += [*_ALLOCATION_COLUMNS.values(), "fleet host bytes"]
     lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     order = [ref] + [a for a in arms if a != ref]
     for arm in order:
@@ -274,6 +389,8 @@ def render_comparison(result: dict, *, ref: Optional[str] = None) -> str:
                 cells.append("—")
                 continue
             cell = f"{_fmt(m, s['median'])} [{_fmt(m, s['min'])}–{_fmt(m, s['max'])}]"
+            if arm in result.get("loop_bound", {}) and s.get("path") in {"throughput_rps", "goodput_rps"}:
+                cell += " (loop_bound)"
             if arm != ref and s.get("ratio_vs_ref") is not None:
                 mark = ""
                 if s.get("better_than_ref") is True:
@@ -282,14 +399,41 @@ def render_comparison(result: dict, *, ref: Optional[str] = None) -> str:
                     mark = " ✗"
                 cell += f" (×{s['ratio_vs_ref']:.3f}{mark})"
             cells.append(cell)
+        if show_allocation:
+            cells.extend(_allocation_cells(st.get("allocations", [])))
         lines.append("| " + " | ".join(cells) + " |")
+    lines.extend(_render_cache_restores(result.get("cache_restores", {}), order))
+    for warning in result.get("allocation_warnings", []):
+        lines.append(f"\n⚠ {warning}")
+    if result.get("signoff"):
+        counts = result["signoff"]
+        lines.extend(["", f"_Reps: {counts['passed']} passed, {counts['void']} void, "
+                      f"{counts['failed']} failed, {counts['warmup']} warm-up._"])
+    if result.get("loop_bound"):
+        lines.extend(["", "_Loop-bound throughput reflects session pacing. "
+                      "Use cache hit rate and TTFT by cache class to compare these runs._"])
+        lines.extend(["", "| arm | loop-bound reps | cache hit rate | TTFT p50 by cache class (ms) |",
+                      "|---|---:|---:|---|"])
+        for arm, reps in result["loop_bound"].items():
+            hit_rates = [r["cache_hit_rate"] for r in reps if "cache_hit_rate" in r]
+            hit = f"{statistics.median(hit_rates):.1%}" if hit_rates else "unavailable"
+            ttfts: dict[str, list[float]] = {}
+            for rep in reps:
+                for cls, value in rep.get("cache_class_ttft_p50_s", {}).items():
+                    if value is not None:
+                        ttfts.setdefault(cls, []).append(value)
+            ttft = ", ".join(f"{cls} {statistics.median(values) * 1000:.1f}"
+                             for cls, values in sorted(ttfts.items())) or "unavailable"
+            lines.append(f"| {arm} | {len(reps)} | {hit} | {ttft} |")
     if result.get("excluded"):
         ex = ", ".join(f"{a}: {n}" for a, n in sorted(result["excluded"].items()))
         lines.append("")
-        lines.append(f"_excluded (void/warm-up): {ex}_")
+        lines.append(f"_Excluded reps: {ex}_")
     if result.get("void"):
         for arm, v in result["void"].items():
-            lines.append(f"_**{arm} VOID**: {v.get('reason', 'void rule violated')}_")
+            reasons = [entry.get("reason") for entry in v.get("violations", [])]
+            detail = ", ".join(reason for reason in reasons if reason) or v.get("reason", "void rule violated")
+            lines.append(f"_**{arm} VOID**: {detail}_")
     return "\n".join(lines)
 
 

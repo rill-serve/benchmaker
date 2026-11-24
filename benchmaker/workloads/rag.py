@@ -131,6 +131,7 @@ class DeepRAGWorkload(Workload):
             item["max_tokens"] = self._max_tokens
         if self._id_key in row:
             item["source_id"] = row[self._id_key]
+            item["meta"] = {"reuse_key": f'rag:{row[self._id_key]}'}
         return item
 
     async def aclose(self) -> None:

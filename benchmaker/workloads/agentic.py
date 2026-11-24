@@ -285,6 +285,7 @@ class AgenticWorkload(Workload):
             conv_id = row.get(self._id_field) or row.get("traj_id")
             meta_base = {
                 "conversation_id": conv_id,
+                "reuse_key": f"trajectory:{conv_id}" if conv_id is not None else None,
                 "instance_id": row.get(self._id_field),
                 "model_label": row.get(self._model_field),
             }

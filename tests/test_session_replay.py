@@ -150,6 +150,8 @@ def test_think_time_delays_the_next_turn(tmp_path):
 
     async def run():
         first = await w.next_item()
+        assert first["meta"]["replay_think_s"] == 0
+        assert first["meta"]["replay_concurrent_sessions"] == 1
         w.notify_turn_complete(first["meta"]["conversation_id"])
         task = asyncio.ensure_future(w.next_item())
         await asyncio.sleep(0.05)
@@ -158,7 +160,9 @@ def test_think_time_delays_the_next_turn(tmp_path):
         w._wakeup.set()
         return await asyncio.wait_for(task, timeout=2)
 
-    assert asyncio.run(run())["meta"]["replay_id"] == "s0.t1"
+    second = asyncio.run(run())["meta"]
+    assert second["replay_id"] == "s0.t1"
+    assert second["replay_think_s"] == 5.0
     assert ReplayWorkload(path, concurrent_sessions=1, think_median_s=0.0).think_median_s == 0.0
 
 
@@ -201,6 +205,29 @@ def test_model_label_filters_sessions(tmp_path):
         ReplayWorkload(path, concurrent_sessions=1, model_label="c")
 
 
+def test_cut_keeps_whole_sessions_and_records_selected_prompt_set(tmp_path):
+    rows = _rows(3, 2, model="a") + [
+        dict(row, session=f"b{row['session']}", id=f"b{row['id']}")
+        for row in _rows(2, 2, model="b")
+    ]
+    # Session rows can be interleaved. The selected hash follows the file order.
+    rows = rows[::2] + rows[1::2]
+    path = _write(tmp_path / "r.jsonl", rows)
+    w = ReplayWorkload(path, concurrent_sessions=2, sessions_per_model=1)
+    expected = [r for r in rows if r["session"] in {"s0", "bs0"}]
+    items = asyncio.run(_drain(w))
+    assert {i["meta"]["replay_id"] for i in items} == {r["id"] for r in expected}
+    assert all(i["meta"]["warmup"] for i in items)
+    assert w.item_count() == 4
+    assert w.content_hash() == prompt_set_sha256(expected)
+    assert w.provenance() == {
+        "source_sha256": prompt_set_sha256(rows), "sessions_per_model": 1,
+        "sessions": 2, "turns": 0, "warmup_turns": 4,
+    }
+    with pytest.raises(ValueError, match="positive integer"):
+        ReplayWorkload(path, concurrent_sessions=1, sessions_per_model=0)
+
+
 def test_exactly_one_mode(tmp_path):
     path = _write(tmp_path / "r.jsonl", _rows())
     for kwargs in ({}, {"concurrent_sessions": 2, "session_rate": 1.0}, {"concurrent_sessions": 0}):
@@ -234,9 +261,16 @@ class _Stub(BaseHTTPRequestHandler):
         pass
 
     def do_POST(self):
-        self.rfile.read(int(self.headers["Content-Length"]))
-        body = json.dumps({"usage": {"prompt_tokens": _Stub.tokens}}).encode()
-        self.send_response(200)
+        request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/fail" and request["messages"][0]["content"] == "s0 t0":
+            status, body = 500, b"failed"
+        elif request.get("stream"):
+            event = {"usage": {"prompt_tokens": _Stub.tokens, "completion_tokens": 5},
+                     "choices": [{"delta": {"content": "ok"}}]}
+            status, body = 200, f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n".encode()
+        else:
+            status, body = 200, json.dumps({"usage": {"prompt_tokens": _Stub.tokens}}).encode()
+        self.send_response(status)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -263,3 +297,71 @@ def test_yaml_and_recipe_registration(tmp_path):
     w = build_workload({"type": "session-replay", "path": path, "concurrent_sessions": 2})
     assert isinstance(w, ReplayWorkload)
     assert recipes.get("session-replay").name == "session-replay"
+
+
+def test_cli_cut_writes_counts_and_marks_short_replay_void(tmp_path):
+    from click.testing import CliRunner
+
+    from benchmaker.cli import main
+
+    path = _write(tmp_path / "r.jsonl", _rows())
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Stub)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{srv.server_address[1]}/v1/chat/completions"
+        command = ["session-replay", "--replay-file", path, "--url", url, "--model", "m",
+                   "--concurrent-sessions", "1", "--sessions-per-model", "2", "--quiet"]
+        result = CliRunner().invoke(main, [*command, "--out-dir", str(tmp_path), "--run-id", "short",
+                                          "--max-requests", "1"])
+        assert result.exit_code == 3, result.output
+        assert "0/2 measured and 1/2 warm-up" in result.output
+        summary = json.loads((tmp_path / "short" / "summary.json").read_text())
+        assert summary["void"]["violations"][0]["rule"] == "replay_completeness"
+
+        result = CliRunner().invoke(main, [*command, "--out-dir", str(tmp_path), "--run-id", "complete"])
+        assert result.exit_code == 0, result.output
+        assert "VOID" not in result.output
+        manifest = json.loads((tmp_path / "complete" / "manifest.json").read_text())
+        summary = json.loads((tmp_path / "complete" / "summary.json").read_text())
+        assert manifest["prompt_set"]["items"] == 4
+        assert manifest["prompt_set"]["hash"] == prompt_set_sha256(_rows()[:4])
+        assert summary["replay_completeness"]["replay"] == {
+            "planned": {"warmup": 2, "measure": 2}, "completed": {"warmup": 2, "measure": 2},
+        }
+        assert summary["void"]["void"] is False
+
+        command[command.index(url)] = f"http://127.0.0.1:{srv.server_address[1]}/fail"
+        result = CliRunner().invoke(main, command)
+        assert result.exit_code == 3, result.output
+        assert "2/2 measured and 1/2 warm-up" in result.output
+    finally:
+        srv.shutdown()
+        thread.join()
+        srv.server_close()
+
+
+async def test_duration_stops_admission_during_replay_think_time(tmp_path, monkeypatch):
+    from benchmaker.core.load import ClosedLoop
+    from benchmaker.core.runner import BenchConfig, BenchRunner
+    from benchmaker.core.types import Response
+    from benchmaker.workloads.http import HttpWorkloadType
+
+    rows = _rows(1, 2, warmup_first=False)
+    rows[1]["after"] = {"think_s": 5}
+    path = _write(tmp_path / "timed.jsonl", rows)
+    workload = ReplayWorkload(path, concurrent_sessions=1)
+    runner = BenchRunner(BenchConfig(
+        workload=workload, workload_type=HttpWorkloadType(),
+        load=ClosedLoop(1, duration_s=0.25), progress_every_s=0,
+    ))
+
+    async def succeed_without_network(*args):
+        return Response(status=200, headers={}, body=b"", elapsed_s=0, ok=True)
+
+    monkeypatch.setattr(runner, "_execute", succeed_without_network)
+    result = await asyncio.wait_for(runner.run(), timeout=2)
+    assert [sample.meta["replay_id"] for sample in result.samples] == ["s0.t0"]
+    assert result.summary["void"]["violations"][0]["reason"] == (
+        "replay completed 1/2 measured and 0/0 warm-up turns"
+    )

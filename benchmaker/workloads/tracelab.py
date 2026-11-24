@@ -410,6 +410,8 @@ class TraceLabWorkload(Workload):
             meta["prefix_tokens_hint"] = prefix_tokens_hint
         if session_rounds is not None:
             meta["tracelab_session_rounds"] = session_rounds
+            if row.get(F_SESSION) is not None:
+                meta["reuse_key"] = f"tracelab:{row[F_SESSION]}"
         if row.get(F_TRACE_KEY) is not None:
             meta["tracelab_trace_key"] = row[F_TRACE_KEY]
         item["meta"] = meta

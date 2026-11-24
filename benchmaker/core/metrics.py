@@ -9,6 +9,8 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Optional, TextIO
 
+from benchmaker.core.cache_reuse import annotate_reuse, reuse_summary
+from benchmaker.core.loop_metrics import closed_loop_summary
 from benchmaker.core.types import Sample
 
 # Series key the LLM workload-types use for per-token inter-token gaps (ms).
@@ -100,6 +102,7 @@ class MetricsAggregator:
 
         # Warm-up requests are recorded (samples.jsonl keeps them, tagged) but
         # excluded from every summary block (#5).
+        annotate_reuse(self.samples)
         warm = [s for s in self.samples if _is_warmup(s)]
         samples = [s for s in self.samples if not _is_warmup(s)]
         # Throughput is measured over the window the measured requests
@@ -112,6 +115,7 @@ class MetricsAggregator:
         out["wall_time_s"] = wall_s
         out["measured_window_s"] = window_s
         out["measured_window"] = {"start_s": w_start - self.start_time, "end_s": w_end - self.start_time}
+        _add_closed_loop(out, samples, w_start, w_end, self.stall_ms)
         if warm:
             out["warmup_excluded"] = len(warm)
 
@@ -130,6 +134,7 @@ class MetricsAggregator:
                     continue
                 phase_wall = max(p_end - p_start, 1e-9)
                 sub = _summary_for_samples(bucket, phase_wall, stall_ms=self.stall_ms)
+                _add_closed_loop(sub, bucket, p_start, p_end, self.stall_ms)
                 sub["lanes"] = _grouped(bucket, "lane", phase_wall, self.stall_ms)
                 # same breakdowns as the top level, so a per-phase cache-class
                 # table (capacity warm vs revisit) falls out of group_by (#2, #5)
@@ -191,6 +196,18 @@ class MetricsAggregator:
                          f"(over the measured {window:.2f}s of {s['wall_time_s']:.2f}s wall)")
         else:
             lines.append(f"  throughput     : {s['throughput_rps']:>10.2f} req/s")
+        if loop := s.get("closed_loop"):
+            label = " (loop_bound)" if loop["loop_bound"] else ""
+            lines.append(
+                f"  closed-loop{label}: {loop['offered_load_rps']:.3g} offered req/s, "
+                f"{loop['mean_think_s']:.3g}s mean think, {loop['mean_service_s']:.3g}s mean service, "
+                f"{loop['utilisation']:.1%} estimated utilisation"
+            )
+        if reuse := s.get("cache_reuse"):
+            lines.append(
+                f"  cache misses   : {reuse['first_touch_misses']} first-touch, "
+                f"{reuse['retouch_misses']} retouch ({reuse['eviction_miss_share']:.2%} of keyed requests)"
+            )
         lines.append(f"  goodput        : {s['goodput_rps']:>10.2f} req/s")
         lines.append(f"  success        : {s['success']}")
         lines.append(f"  failed         : {s['failed']}  ({s['error_rate']*100:.2f}%)")
@@ -259,6 +276,7 @@ class MetricsAggregator:
         Raw ``series`` (per-token gaps) are included only when ``dump_series``
         is on — they dominate the file size otherwise (#1).
         """
+        annotate_reuse(self.samples)
         with open(path, "w") as f:
             for s in self.samples:
                 rec = {
@@ -384,7 +402,29 @@ def _summary_for_samples(samples: list[Sample], wall_s: float,
                 float(s.extra.get("itl_tokens_per_event_mean", 1.0)) for s in itl_samples),
         }
 
+    if reuse := reuse_summary(samples):
+        out["cache_reuse"] = reuse
     return out
+
+
+def _add_closed_loop(
+    out: dict, samples: list[Sample], start: float, end: float, stall_ms: Optional[float]
+) -> None:
+    loop = closed_loop_summary(samples, start, end, throughput_rps=out["throughput_rps"])
+    if not loop:
+        return
+    out["closed_loop"] = loop
+    if loop["loop_bound"]:
+        cache = [s for s in samples if s.meta.get("cache_class") in
+                 ("miss", "device_hit", "partial", "restore", "unknown")]
+        if cache:
+            loop["cache_hit_rate"] = sum(s.meta["cache_class"] != "miss" for s in cache) / len(cache)
+            wall_s = max(end - start, 1e-9)
+            groups = _grouped(cache, "cache_class", wall_s, stall_ms)
+            loop["cache_class_ttft_p50_s"] = {
+                cls: sub.get("workload_metrics", {}).get("ttft_s", {}).get("p50")
+                for cls, sub in groups.items()
+            }
 
 
 def measured_window(samples: list[Sample], start_time: float, end_time: float) -> tuple[float, float, float]:

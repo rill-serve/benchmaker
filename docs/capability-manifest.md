@@ -221,3 +221,48 @@ Pass `record_env: [MY_SERVER_*]` in YAML to record more.
 A difference in `prompt_set.hash` between two bundles that are supposed to
 compare the same prompts is the most common silent error in benchmarking;
 check it first.
+
+### KV allocation
+
+`manifest.json` records device KV tokens, host-tier bytes and tokens, the
+host allocation's bytes per token, sharing, and fleet host bytes under
+`allocation`. With several endpoints, `endpoints.<model>.allocation` records
+each engine's capacity, and the arm's `allocation.fleet_host_total_bytes`
+counts each shared pool once. An uncapped shared pool has an arm total and
+unknown per-engine capacity. Each reported value has a `sources` entry with
+its origin and input unit. Missing values are written as `null`.
+
+For endpoints serving Rill, set their capability URL to `/get_server_info`
+to capture `kv_capacity_tokens`. Point `allocation.kvd_log` at the daemon's
+startup log to capture its RAM pool and any per-model limit in GiB. The
+daemon socket identifies the shared group. For private deployments, set
+`sharing: private` in each endpoint's allocation options.
+
+For vLLM, LMCache, and SGLang, use an engine startup log that contains the
+capacity lines. With one endpoint, Benchmaker uses the managed arm's launch
+log by default. Set `allocation.startup_log` for an external engine or a
+launcher that redirects engine output. With several endpoints, configure
+one log per endpoint. Within an arm definition, put these options under
+`config.allocation`.
+
+```yaml
+allocation:
+  endpoints:
+    model-a:
+      startup_log: logs/model-a.log
+      bytes_per_token: 147456
+    model-b:
+      startup_log: logs/model-b.log
+      bytes_per_token: 147456
+```
+
+Set `bytes_per_token` to the host KV layout's actual size to convert between
+bytes and tokens when one is missing. vLLM `kv_offloading_size` and LMCache
+`max_local_cpu_size` use GiB. SGLang's HiCache log reports tokens and can also
+report rounded decimal GB. The manifest marks that bytes value and conversions
+derived from it as approximate. Supply logs scoped to an engine with a
+single capacity report for each cache tier.
+
+`benchmaker compare` shows the capacities alongside the benchmark metrics
+and warns when two arms' known fleet totals differ by more than 5% of the
+larger total.

@@ -214,7 +214,11 @@ def arms(config_path: str, out_dir: str, run_id: str | None, labels: tuple[str, 
     if result.get("same_job_violations") and not runner.settings.allow_mixed_jobs:
         sys.stderr.write("[benchmaker] refusing to merge results across jobs/hosts; "
                          "re-run with --allow-mixed-jobs to accept.\n")
-        sys.exit(runner.exit_code(result))
+    exit_code = runner.exit_code(result)
+    if exit_code:
+        if exit_code == 1:
+            sys.stderr.write("[benchmaker] no measured repetitions passed.\n")
+        sys.exit(exit_code)
 
 
 @main.command("compare")

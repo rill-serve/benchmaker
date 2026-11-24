@@ -6,11 +6,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import httpx2
 
+from benchmaker.core.cache_counters import Series, counter_restores, response_restores
 from benchmaker.core.capability import (
     VoidRule,
     evaluate_void_rules,
@@ -36,10 +38,11 @@ from benchmaker.core.types import (
     TicketContext,
     maybe_await,
 )
-from benchmaker.core.monitors import Monitor, run_monitor_loop
+from benchmaker.core.monitors import Monitor, PrometheusMonitor, run_monitor_loop
 from benchmaker.core.trace import TraceRecorder
 from benchmaker.workloads.base import WorkloadType
 from benchmaker.workloads.datasets import Workload, StaticWorkload
+from benchmaker.workloads.session_replay import ReplayWorkload
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +50,20 @@ logger = logging.getLogger(__name__)
 def _workload_url(wt: Any) -> Optional[str]:
     """The workload-type's request URL (public ``url`` attribute or ``_url``)."""
     return getattr(wt, "url", None) or getattr(wt, "_url", None)
+
+
+@asynccontextmanager
+async def _admission_window(load: LoadModel, workload: Workload):
+    # A replay can wait for think time or a future session after receiving a
+    # ticket. Bound that wait while leaving requests already sent to drain.
+    duration = getattr(load, "duration_s", None) if isinstance(workload, ReplayWorkload) else None
+    window = asyncio.timeout(duration)
+    try:
+        async with window:
+            yield window.when()
+    except TimeoutError:
+        if not window.expired():
+            raise
 
 
 @dataclass
@@ -155,6 +172,7 @@ class BenchConfig:
     # Extra void violations to record (lifecycle checks run by `benchmaker
     # arms`, issue #9) — merged into ``summary["void"]`` on every write.
     extra_void: list[dict] = field(default_factory=list)
+    allocation: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.phases:
@@ -189,6 +207,13 @@ class BenchResult:
 class BenchRunner:
     def __init__(self, config: BenchConfig):
         self.cfg = config
+        self._cache_monitors = [
+            mon for mon in config.monitors if isinstance(mon, PrometheusMonitor) and mon.cache_restore
+        ]
+        for monitor in self._cache_monitors:
+            if sum(m.name == monitor.name for m in config.monitors) != 1:
+                raise ValueError(f"cache restore monitor name {monitor.name!r} must be unique")
+        self._monitor_boundaries: dict[str, dict[str, Series | None]] = {}
         self.metrics = MetricsAggregator(
             stall_ms=config.stall_ms,
             group_by=list(config.group_by),
@@ -198,6 +223,11 @@ class BenchRunner:
         self.capability: Optional[dict[str, Any]] = None
         self.routing_unmatched = 0  # requests whose model named no endpoint (issue #15)
         self._warned_unrouted = False
+        self._post_hooks = tuple(
+            h for h in config.post_hooks
+            if not (isinstance(owner := getattr(h, "__self__", None), ReplayWorkload)
+                    and h == owner.completion_hook())
+        )
 
     async def run(self) -> BenchResult:
         # httpx2 has no per-connector force_close / ttl_dns_cache knobs; pooling
@@ -233,15 +263,48 @@ class BenchRunner:
 
     def _summary(self) -> dict:
         summary = self.metrics.summary()
+        restores = self._cache_restores()
+        if restores:
+            summary["cache_restores"] = restores
+        replays = self._replay_completeness()
+        if replays:
+            summary["replay_completeness"] = replays
         if (self.capability is not None or self.cfg.extra_void
-                or self.routing_unmatched):
+                or self.routing_unmatched or replays):
             summary["capability"] = self.capability
-            summary["void"] = self.void_verdict()
+            summary["void"] = self.void_verdict(replays)
         if self.cfg.endpoints:
             summary["endpoints"] = self.cfg.endpoints
         return summary
 
-    def void_verdict(self) -> dict:
+    def _cache_restores(self) -> dict:
+        """Counter scopes span the step, including warm-up and the drain."""
+        reports = {}
+        for mon in self._cache_monitors:
+            boundary = self._monitor_boundaries.get(mon.name, {})
+            start, end = boundary.get("start"), boundary.get("end")
+            snapshots = []
+            if start is not None and end is not None:
+                snapshots = [values for _, values in self.metrics.monitor_samples[mon.name]]
+            reports[mon.name] = counter_restores(
+                snapshots, bytes_per_token=mon.bytes_per_token, block_size_tokens=mon.block_size_tokens,
+            )
+            reports[mon.name]["scope"] = "step including warm-up"
+        measured = [s for s in self.metrics.samples if not s.meta.get(WARMUP_META_KEY) and s.request_ok]
+        if response_report := response_restores(measured):
+            reports["response usage"] = {**response_report, "scope": "measured responses"}
+        return reports
+
+    def _replay_completeness(self) -> dict:
+        if self.cfg.phases:
+            workloads = {f"{p.name}/{lane.name}": lane.workload for p in self.cfg.phases for lane in p.lanes}
+        elif self.cfg.lanes:
+            workloads = {lane.name: lane.workload for lane in self.cfg.lanes}
+        else:
+            workloads = {"replay": self.cfg.workload}
+        return {name: w.completeness() for name, w in workloads.items() if isinstance(w, ReplayWorkload)}
+
+    def void_verdict(self, replays: Optional[dict] = None) -> dict:
         """``{"void", "violations", "checks"}`` over every endpoint's snapshots
         (issue #8; a rule scoped to one endpoint — ``endpoint:`` or an
         ``endpoints.<model>.`` path — is only checked against that one,
@@ -265,14 +328,25 @@ class BenchRunner:
                 "routing",
                 f"{self.routing_unmatched} request(s) named a model with no endpoint and were not sent",
             ))
+        for name, counts in (self._replay_completeness() if replays is None else replays).items():
+            planned, completed = counts["planned"], counts["completed"]
+            if completed != planned:
+                extra.append(hook_violation(
+                    "replay_completeness",
+                    f"{name} completed {completed['measure']}/{planned['measure']} measured and "
+                    f"{completed['warmup']}/{planned['warmup']} warm-up turns",
+                    at="end", expected=planned, actual=completed,
+                ))
         if extra:
             verdicts.append({"void": True, "violations": extra, "checks": []})
         return merge_void_verdicts(verdicts)
 
     def is_void(self) -> bool:
         """True when a [void rule](../core/capability.py) was violated (issue #4)."""
-        verdict = self._summary().get("void")
-        return bool(verdict and verdict.get("void"))
+        replays = self._replay_completeness()
+        if self.capability is None and not (self.cfg.extra_void or self.routing_unmatched or replays):
+            return False
+        return bool(self.void_verdict(replays)["void"])
 
     async def _capture(self, at: str) -> None:
         """Snapshot every capability source at ``at`` (``start`` | ``end``).
@@ -356,14 +430,22 @@ class BenchRunner:
         # Spawn monitor loops.
         monitor_stop = asyncio.Event()
         monitor_tasks: list[asyncio.Task] = []
+        ready_monitors: list[asyncio.Event] = []
         bench_start = self.metrics.start_time
         for mon in self.cfg.monitors:
             buf = self.metrics.monitor_buffer(mon.name)
+            ready = boundaries = None
+            if mon in self._cache_monitors:
+                ready = asyncio.Event()
+                ready_monitors.append(ready)
+                boundaries = self._monitor_boundaries[mon.name] = {}
             monitor_tasks.append(asyncio.create_task(
-                run_monitor_loop(mon, buf, bench_start, monitor_stop)
+                run_monitor_loop(mon, buf, bench_start, monitor_stop, ready=ready, boundaries=boundaries)
             ))
 
         try:
+            if ready_monitors:
+                await asyncio.gather(*(ready.wait() for ready in ready_monitors))
             if self.cfg.phases:
                 for phase in self.cfg.phases:
                     await self._drive_phase(session, sem, tasks, phase)
@@ -390,20 +472,33 @@ class BenchRunner:
                             sem: asyncio.Semaphore,
                             tasks: set[asyncio.Task]) -> None:
         assert self.cfg.load is not None
-        async for _ in self.cfg.load.tickets():
-            try:
-                item = await self.cfg.workload.next_item()
-            except StopAsyncIteration:
-                if self.cfg.stop_on_exhausted:
-                    break
-                continue
+        await self._produce(session, sem, tasks, self.cfg.load, self.cfg.workload)
 
-            await sem.acquire()
-            task = asyncio.create_task(
-                self._fire(session, item, sem, self.cfg.load)
-            )
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
+    async def _produce(self, session: httpx2.AsyncClient, sem: asyncio.Semaphore,
+                       tasks: set[asyncio.Task], load: LoadModel, workload: Workload,
+                       lane: Optional[BenchLane] = None, phase: Optional[str] = None) -> None:
+        loop = asyncio.get_running_loop()
+        async with _admission_window(load, workload) as deadline:
+            async for _ in load.tickets():
+                try:
+                    item = await workload.next_item()
+                except StopAsyncIteration:
+                    if self.cfg.stop_on_exhausted:
+                        break
+                    continue
+
+                await sem.acquire()
+                if deadline is not None and loop.time() >= deadline:
+                    sem.release()
+                    break
+                task = asyncio.create_task(
+                    self._fire(session, item, sem, load,
+                               lane_name=lane.name if lane else None, phase=phase,
+                               model=lane.model if lane else None, lane_meta=lane.meta if lane else None,
+                               workload=workload)
+                )
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
 
     async def _drive_phase(self, session: httpx2.AsyncClient,
                            sem: asyncio.Semaphore,
@@ -439,24 +534,11 @@ class BenchRunner:
         bursty and another drives a long complementary phase.
         """
 
-        async def produce(lane: BenchLane) -> None:
-            async for _ in lane.load.tickets():
-                try:
-                    item = await lane.workload.next_item()
-                except StopAsyncIteration:
-                    if self.cfg.stop_on_exhausted:
-                        break
-                    continue
-
-                await sem.acquire()
-                task = asyncio.create_task(
-                    self._fire(session, item, sem, lane.load, lane.name,
-                               phase=phase_name, model=lane.model, lane_meta=lane.meta)
-                )
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
-
-        producers = [asyncio.create_task(produce(lane)) for lane in lanes]
+        producers = [
+            asyncio.create_task(self._produce(session, sem, tasks, lane.load, lane.workload,
+                                              lane=lane, phase=phase_name))
+            for lane in lanes
+        ]
         try:
             await asyncio.gather(*producers)
         finally:
@@ -471,13 +553,18 @@ class BenchRunner:
                     phase: Optional[str] = None,
                     model: Optional[str] = None,
                     overrides: Optional[dict[str, Any]] = None,
-                    lane_meta: Optional[dict[str, Any]] = None) -> None:
+                    lane_meta: Optional[dict[str, Any]] = None,
+                    workload: Optional[Workload] = None) -> None:
         start_mono = time.monotonic()
         warmup = self._is_warmup(start_mono)
         self._fired += 1
         lane_meta = dict(lane_meta or {})
         if model:
             overrides = {"model": model, **(overrides or {})}
+        workload = self.cfg.workload if workload is None else workload
+        replay_meta = item["meta"] if isinstance(workload, ReplayWorkload) else {}
+        warmup = warmup or bool(replay_meta.get(WARMUP_META_KEY))
+        completed_ok = False
         try:
             async def fire(req: Request) -> Response:
                 if lane_name is not None:
@@ -495,6 +582,12 @@ class BenchRunner:
                     req = await maybe_await(hook(req))
                 self._route(req)
                 fire_start = time.monotonic()
+                if req.meta.get("reuse_key") is not None or "replay_concurrent_sessions" in req.meta:
+                    if isinstance(req.json, dict) and isinstance(req.json.get("model"), str):
+                        req.meta["endpoint_model"] = req.json["model"]
+                    elif req.meta.get("model_label") is not None:
+                        req.meta.setdefault("model", req.meta["model_label"])
+                    req.meta["service_start_ts"] = fire_start
                 if self.cfg.recorder is not None:
                     await self.cfg.recorder.record(req, fire_start)
                 return await self._execute(session, req, fire_start)
@@ -504,7 +597,7 @@ class BenchRunner:
                 start_mono=start_mono,
                 fire=fire,
                 pre_hooks=tuple(self.cfg.pre_hooks),
-                post_hooks=tuple(self.cfg.post_hooks),
+                post_hooks=self._post_hooks,
                 workload_name=self.cfg.workload_type.name,
                 overrides=dict(overrides or {}),
             )
@@ -518,6 +611,7 @@ class BenchRunner:
             for k, v in lane_meta.items():
                 sample.meta.setdefault(k, v)
             self.metrics.add(sample)
+            completed_ok = sample.ok
         except Exception as e:
             fail_meta = {k: v for k, v in (("phase", phase), (WARMUP_META_KEY, True if warmup else None)) if v is not None}
             self.metrics.add(_failure_sample(
@@ -529,6 +623,8 @@ class BenchRunner:
         finally:
             sem.release()
             load.on_complete()
+            if isinstance(workload, ReplayWorkload):
+                workload.record_turn_result(replay_meta["conversation_id"], ok=completed_ok)
 
     def _route(self, req: Request) -> None:
         """Issue #8: with an endpoint map, the request's model (a lane's
@@ -706,6 +802,7 @@ class BenchRunner:
             else self.cfg.workload.name
         )
         if manifest is None:
+            start_hook = (kwargs.get("hooks") or {}).get("start") or {}
             manifest = build_manifest(
                 source_config=source_config or {},
                 run_id=str(kwargs.get("run_id") or ""),
@@ -721,6 +818,8 @@ class BenchRunner:
                 benchmaker_version=bm_version,
                 endpoints=self.cfg.endpoints or None,
                 template_url=_workload_url(self.cfg.workload_type),
+                allocation=self.cfg.allocation,
+                launch_log=start_hook.get("log"),
             )
         return write_bundle(
             out_dir,

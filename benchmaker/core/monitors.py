@@ -15,11 +15,14 @@ Typical use cases:
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Awaitable, Callable, Optional, Union
+from typing import Awaitable, Callable, Optional, Union
 
 import httpx2
+
+from benchmaker.core.cache_counters import CACHE_COUNTER_NAMES, Series
 
 
 class Monitor(ABC):
@@ -82,6 +85,9 @@ class PrometheusMonitor(Monitor):
             with identical names are summed.
         headers: HTTP headers (e.g. Authorization).
         interval_s: scrape interval.
+        cache_restore: record step-boundary snapshots for host KV attribution.
+        bytes_per_token: measured host KV geometry used for missing units.
+        block_size_tokens: measured token capacity of one engine KV block.
     """
 
     def __init__(
@@ -94,9 +100,24 @@ class PrometheusMonitor(Monitor):
         name: str = "prometheus",
         tick_at_start: bool = True,
         timeout_s: float = 5.0,
+        cache_restore: bool = False,
+        bytes_per_token: float | None = None,
+        block_size_tokens: int | None = None,
     ):
         self._url = url
         self._names = set(metric_names) if metric_names else None
+        if cache_restore:
+            if not labelled_keys:
+                raise ValueError("cache_restore requires labelled_keys")
+            if self._names is not None:
+                self._names.update(CACHE_COUNTER_NAMES)
+        if bytes_per_token is not None and (not math.isfinite(bytes_per_token) or bytes_per_token <= 0):
+            raise ValueError("bytes_per_token must be finite and positive")
+        if block_size_tokens is not None and (not isinstance(block_size_tokens, int) or block_size_tokens <= 0):
+            raise ValueError("block_size_tokens must be a positive integer")
+        self.cache_restore = cache_restore
+        self.bytes_per_token = bytes_per_token
+        self.block_size_tokens = block_size_tokens
         self._labelled = labelled_keys
         self._headers = headers or {}
         self.interval_s = interval_s
@@ -183,6 +204,9 @@ async def run_monitor_loop(
     samples: list[tuple[float, dict[str, float]]],
     start_mono: float,
     stop_event: asyncio.Event,
+    *,
+    ready: asyncio.Event | None = None,
+    boundaries: dict[str, Series | None] | None = None,
 ) -> None:
     """Drive a single monitor until `stop_event` is set.
 
@@ -195,20 +219,32 @@ async def run_monitor_loop(
         await monitor.setup()
     except Exception as e:
         sys.stderr.write(f"[monitor:{monitor.name}] setup failed: {e}\n")
+        if ready is not None:
+            ready.set()
         return
 
     try:
-        if monitor.tick_at_start:
+        if boundaries is not None:
+            boundaries["start"] = await _safe_tick(monitor, samples, start_mono)
+        elif monitor.tick_at_start:
             await _safe_tick(monitor, samples, start_mono)
+        if ready is not None:
+            ready.set()
 
         while not stop_event.is_set():
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=monitor.interval_s)
-                # If we get here, stop was signalled — do one final tick and exit.
-                await _safe_tick(monitor, samples, start_mono)
+                final = await _safe_tick(monitor, samples, start_mono)
+                if boundaries is not None:
+                    boundaries["end"] = final
                 break
             except asyncio.TimeoutError:
                 await _safe_tick(monitor, samples, start_mono)
+        else:
+            # The run can drain while the last periodic scrape is in flight.
+            # For an opted-in restore monitor, still collect a post-run scrape.
+            if boundaries is not None:
+                boundaries["end"] = await _safe_tick(monitor, samples, start_mono)
     finally:
         try:
             await monitor.aclose()
@@ -216,13 +252,15 @@ async def run_monitor_loop(
             sys.stderr.write(f"[monitor:{monitor.name}] aclose failed: {e}\n")
 
 
-async def _safe_tick(monitor: Monitor, samples: list, start_mono: float) -> None:
+async def _safe_tick(monitor: Monitor, samples: list, start_mono: float) -> Series | None:
     import sys
     try:
         values = await monitor.tick()
     except Exception as e:
         sys.stderr.write(f"[monitor:{monitor.name}] tick error: {e}\n")
-        return
+        return None
     if not values:
-        return
-    samples.append((time.monotonic() - start_mono, dict(values)))
+        return None
+    snapshot = dict(values)
+    samples.append((time.monotonic() - start_mono, snapshot))
+    return snapshot

@@ -20,6 +20,7 @@ import importlib
 from typing import Any, Callable, Optional
 
 from benchmaker.env import interpolate, load_dotenv
+from benchmaker.core.allocation import normalize_allocation_config
 from benchmaker.core.capability import parse_void_rules, validate_rule_scopes
 from benchmaker.core.endpoints import normalize_endpoints
 from benchmaker.core.load import TraceArrivalsLoad, parse_duration, parse_rate_spec
@@ -516,6 +517,7 @@ def build_config(cfg: dict, dotenv_path: Optional[str] = ".env",
         model_revision=(str(cfg["model_revision"]) if cfg.get("model_revision") else None),
         record_env=[str(k) for k in (cfg.get("record_env") or [])],
         endpoints=endpoints,
+        allocation=normalize_allocation_config(cfg.get("allocation"), set(endpoints)),
     )
 
 

@@ -551,6 +551,8 @@ def finish_llm_sample(sample: Sample, request: Request, response: Response, st: 
         sample.extra["prompt_tokens"] = float(prompt_tokens)
     if cached_tokens is not None:
         sample.extra["cached_tokens"] = float(cached_tokens)
+    if st.restored_tokens is not None:
+        sample.extra["restored_tokens"] = float(st.restored_tokens)
     if cached_tokens is not None and prompt_tokens:
         sample.extra["cached_ratio"] = float(cached_tokens) / float(prompt_tokens)
     # Cache class (issue #2): device_hit / restore / partial / miss. Only

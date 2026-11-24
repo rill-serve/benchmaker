@@ -31,6 +31,7 @@ import socket
 import subprocess
 from typing import Any, Optional
 
+from benchmaker.core.allocation import build_allocation
 from benchmaker.core.capability import extract_model_identity
 from benchmaker.core.endpoints import route_url
 
@@ -126,6 +127,8 @@ def build_manifest(
     benchmaker_version: str = "",
     endpoints: Optional[dict] = None,
     template_url: Optional[str] = None,
+    allocation: Optional[dict] = None,
+    launch_log: Optional[str] = None,
 ) -> dict:
     """Assemble the manifest dict. See module docstring for the fields.
 
@@ -140,6 +143,9 @@ def build_manifest(
 
     wt_model = getattr(workload_type, "model", None)
     cap = capability or {}
+    arm_allocation, endpoint_allocations = build_allocation(
+        allocation or {}, cap, endpoints or {}, launch_log=launch_log,
+    )
 
     def _identity(snaps: Optional[dict]) -> dict:
         snaps = snaps or {}
@@ -198,6 +204,7 @@ def build_manifest(
             **(env or {}),
         },
         "labels": dict(labels or {}),
+        "allocation": arm_allocation,
     }
     if endpoints:
         per = cap.get("endpoints") or {}
@@ -211,6 +218,7 @@ def build_manifest(
                 "capability_model": ident.get("model"),
                 "revision": ident.get("revision"),
                 "revision_source": ident.get("source"),
+                "allocation": endpoint_allocations[name],
             }
             if url != raw_url:
                 manifest["endpoints"][name]["configured_url"] = raw_url

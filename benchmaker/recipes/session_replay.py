@@ -38,6 +38,8 @@ class ReplayRecipe(Recipe):
             click.option("--header", "-H", "header", multiple=True, help="Extra header 'Name: value'. Repeatable."),
             click.option("--model-label", "model_label", default=None,
                          help="Replay only the sessions whose row 'model' equals this label (multi-model files)."),
+            click.option("--sessions-per-model", type=click.IntRange(min=1),
+                         help="Keep the first N whole sessions per model, in file order."),
             click.option("--concurrent-sessions", "concurrent_sessions", type=int, default=None,
                          help="Closed loop: N sessions active (default 8 when no other mode is given)."),
             click.option("--session-rate", "session_rate", type=float, default=None,
@@ -57,7 +59,7 @@ class ReplayRecipe(Recipe):
 
     def build(self, shared: SharedOpts, *, replay_file, url, model, api_key, header, model_label=None,
               concurrent_sessions=None, session_rate=None, trace_scale=None, think_median_s=None,
-              max_in_flight=None, template_check=True, seed=0) -> BuildResult:
+              max_in_flight=None, template_check=True, seed=0, sessions_per_model=None) -> BuildResult:
         from benchmaker.workloads.llm import OpenAIChatWorkloadType
         from benchmaker.workloads.session_replay import ReplayWorkload
         from benchmaker.workloads.session_replay import template_check as probe_check
@@ -71,7 +73,8 @@ class ReplayRecipe(Recipe):
         try:
             workload = ReplayWorkload(replay_file, concurrent_sessions=concurrent_sessions,
                                       session_rate=session_rate, trace_scale=trace_scale,
-                                      think_median_s=think_median_s, seed=seed, model_label=model_label)
+                                      think_median_s=think_median_s, seed=seed, model_label=model_label,
+                                      sessions_per_model=sessions_per_model)
         except ValueError as e:
             raise click.UsageError(str(e)) from e
 
@@ -92,6 +95,7 @@ class ReplayRecipe(Recipe):
                               **{k: v for k, v in wt_kwargs.items() if k != "headers"}},
             "workload": {"type": "session-replay", "path": replay_file, "model_label": model_label,
                          "concurrent_sessions": concurrent_sessions, "session_rate": session_rate,
+                         "sessions_per_model": sessions_per_model,
                          "trace_scale": trace_scale, "think_median_s": workload.think_median_s,
                          "think_sigma": workload.think_sigma, "seed": seed,
                          "prompt_set_sha256": workload.content_hash(), "template_check": check},

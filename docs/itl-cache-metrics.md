@@ -274,3 +274,17 @@ For a multi-arm comparison, the recommended order is:
 
 See [Multi-arm comparisons](arms.md) for the commands that put all of this
 in one table.
+
+### First-touch and retouch misses
+
+Capacity, session replay, and other workloads with known prefix identity attach
+`meta.reuse_key`. Custom workloads can set it on any item. A miss is tagged
+`cache_miss_kind=first_touch` or `retouch` using request start order within the
+endpoint and model. Earlier successful requests, including warm-up, establish a
+touch. Each phase keeps the history of earlier phases in the same run.
+
+The `cache_reuse` summary reports the counts and `eviction_miss_share` (retouch
+misses divided by requests with both a reuse key and a cache classification).
+Retouch misses estimate eviction pressure. Overlapping requests, prefix
+changes within a reuse group, and server cache admission rules can also cause
+retouch misses. Tier counts use the subset with explicit device or restore hints.

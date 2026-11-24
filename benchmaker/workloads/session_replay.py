@@ -42,6 +42,7 @@ import json
 import math
 import random
 import time
+from collections import Counter
 from typing import Any, Callable, Optional
 
 from benchmaker.workloads.datasets import Workload
@@ -104,6 +105,7 @@ def to_item(row: dict) -> dict:
                                  f"workload_type: {{type: openai-completions}}, #11)")
     meta = {
         "conversation_id": row["session"],
+        "reuse_key": f'session:{row["session"]}',
         "turn_index": row.get("turn"),
         "replay_id": row.get("id"),
         "model_label": row.get("model"),
@@ -137,7 +139,7 @@ class ReplayWorkload(Workload):
 
     def __init__(self, path: str, *, concurrent_sessions: Optional[int] = None, session_rate: Optional[float] = None,
                  trace_scale: Optional[float] = None, think_median_s: Optional[float] = None, seed: int = 0,
-                 model_label: Optional[str] = None, verify: bool = True,
+                 model_label: Optional[str] = None, sessions_per_model: Optional[int] = None, verify: bool = True,
                  clock: Callable[[], float] = time.monotonic):
         modes = [m for m in (concurrent_sessions, session_rate, trace_scale) if m is not None]
         if len(modes) != 1:
@@ -146,6 +148,10 @@ class ReplayWorkload(Workload):
             raise ValueError("concurrent_sessions must be >= 1")
         if session_rate is not None and session_rate <= 0:
             raise ValueError("session_rate must be > 0")
+        if sessions_per_model is not None and (
+            type(sessions_per_model) is not int or sessions_per_model < 1
+        ):
+            raise ValueError("sessions_per_model must be a positive integer")
         self.path = path
         self.manifest, rows = load_replay(path, verify=verify)
         self._groups = group_sessions(rows)
@@ -153,6 +159,29 @@ class ReplayWorkload(Workload):
             self._groups = [g for g in self._groups if g[0].get("model") == model_label]
             if not self._groups:
                 raise ValueError(f"{path}: no sessions with model label {model_label!r}")
+        if sessions_per_model is not None:
+            selected = []
+            counts: Counter = Counter()
+            for group in self._groups:
+                label = group[0].get("model")
+                if counts[label] < sessions_per_model:
+                    selected.append(group)
+                    counts[label] += 1
+            self._groups = selected
+        self._provenance: dict[str, Any] = {}
+        if sessions_per_model is not None or model_label is not None:
+            session_ids = {group[0]["session"] for group in self._groups}
+            retained = [row for row in rows if row["session"] in session_ids]
+            self._provenance.update(
+                source_sha256=prompt_set_sha256(rows),
+                sessions_per_model=sessions_per_model,
+            )
+            self.manifest["prompt_set_sha256"] = prompt_set_sha256(retained)
+        self._planned = Counter(
+            "warmup" if row.get("tag") == "warmup" else "measure"
+            for group in self._groups for row in group
+        )
+        self._completed: Counter = Counter()
         think = self.manifest.get("think") or {}
         self.think_median_s = float(think_median_s if think_median_s is not None else think.get("median_s") or 0.0)
         self.think_sigma = float(think.get("sigma") or 0.0)
@@ -169,7 +198,21 @@ class ReplayWorkload(Workload):
         self._wakeup: Optional[asyncio.Event] = None
 
     def item_count(self) -> Optional[int]:
-        return sum(len(g) for g in self._groups)
+        return self._planned.total()
+
+    def provenance(self) -> dict:
+        return {
+            **self._provenance,
+            "sessions": len(self._groups),
+            "turns": self._planned["measure"],
+            "warmup_turns": self._planned["warmup"],
+        }
+
+    def completeness(self) -> dict:
+        return {
+            "planned": {tag: self._planned[tag] for tag in ("measure", "warmup")},
+            "completed": {tag: self._completed[tag] for tag in ("measure", "warmup")},
+        }
 
     @property
     def model_labels(self) -> set[str]:
@@ -242,7 +285,13 @@ class ReplayWorkload(Workload):
                 row = sess.rows[sess.idx]
                 sess.idx += 1
                 sess.in_flight = True
-                return to_item(row)
+                item = to_item(row)
+                if self._concurrency is not None:
+                    item["meta"]["replay_concurrent_sessions"] = self._concurrency
+                    item["meta"]["replay_think_s"] = (
+                        think_seconds(row, self.think_median_s, self.think_sigma) if sess.idx > 1 else 0.0
+                    )
+                return item
             if not self._active and self._next >= len(self._groups):
                 raise StopAsyncIteration
             self._wakeup.clear()
@@ -264,9 +313,16 @@ class ReplayWorkload(Workload):
 
     def note_complete_hook(self, request: Any, response: Any, sample: Any) -> Any:
         sid = (getattr(request, "meta", None) or {}).get("conversation_id")
-        if sid is not None:
-            self.notify_turn_complete(sid)
+        self.record_turn_result(sid, ok=getattr(sample, "ok", False))
         return sample
+
+    def record_turn_result(self, sid: Any, *, ok: bool) -> None:
+        sess = self._by_sid.get(sid)
+        if sess is not None and sess.in_flight:
+            if ok:
+                tag = sess.rows[sess.idx - 1].get("tag")
+                self._completed["warmup" if tag == "warmup" else "measure"] += 1
+            self.notify_turn_complete(sid)
 
     def completion_hook(self) -> Optional[Callable]:
         return self.note_complete_hook

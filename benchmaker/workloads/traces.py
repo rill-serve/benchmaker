@@ -227,7 +227,10 @@ def load_mooncake_trace(path: str, *, timestamp_unit: str = "ms",
             raw_ts.append(0.0)
             continue
         raw_ts.append(ts)
-        parsed.append((ts, inp, out if out is not None else 0, _as_hash_ids(row.get("hash_ids"))))
+        parsed.append((
+            ts, inp, out if out is not None else 0, _as_hash_ids(row.get("hash_ids")),
+            row.get("reuse_key"),
+        ))
 
     if timestamp_unit == "auto":
         timestamp_unit = _detect_ts_unit(raw_ts)
@@ -242,15 +245,18 @@ def load_mooncake_trace(path: str, *, timestamp_unit: str = "ms",
         if item is None:
             dropped["malformed"] = dropped.get("malformed", 0) + 1
             continue
-        ts, inp, out, hashes = item
+        ts, inp, out, hashes, reuse_key = item
         if inp <= 0:
             dropped["zero_input"] = dropped.get("zero_input", 0) + 1
             continue
         if hashes:
             _block_usage(inp, hashes, block_size, blocks)
+        meta: dict[str, Any] = {"block_size": block_size}
+        if isinstance(reuse_key, (str, int)):
+            meta["reuse_key"] = reuse_key
         records.append(TraceRecord(
             t_s=(ts - t0) * scale, input_tokens=inp, output_tokens=max(out, 1),
-            hash_ids=hashes, meta={"block_size": block_size},
+            hash_ids=hashes, meta=meta,
         ))
     records.sort(key=lambda r: r.t_s)
     records = _limit(records, max_records=max_records, max_duration_s=max_duration_s,
@@ -602,6 +608,8 @@ class TraceReplayWorkload(Workload):
             **({"trace_pass": self._pass} if self._loop else {}),
             **({"trace_meta": rec.meta} if rec.meta else {}),
         }
+        if rec.meta and rec.meta.get("reuse_key") is not None:
+            meta["reuse_key"] = rec.meta["reuse_key"]
         if self._ids is not None:
             return {"prompt": prompt, "max_tokens": int(max(out_tokens, 1)), "meta": meta}
         return {

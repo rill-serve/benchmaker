@@ -149,3 +149,53 @@ async def test_cache_hint_vocabulary_is_words_not_substrings():
     s = await wt.make_sample("hi", await wt.make_request("hi"),
                              _cached(100, header={"X-Cache-Source": "host_dram"}), 0.0)
     assert s.meta["cache_class"] == "restore"
+
+
+def test_cache_reuse_uses_dispatch_order_and_warmup_per_endpoint_model(tmp_path):
+    agg = MetricsAggregator()
+    for ts, endpoint, model, cls, warmup, hint in [
+        (6, "a", "m", "miss", False, None),
+        (1, "a", "m", "miss", True, "host"),
+        (2, "b", "m", "miss", False, "host"),
+        (3, "a", "n", "miss", False, "host"),
+        (4, "a", "m", "restore", False, "host"),
+        (5, "a", "m", "miss", False, "host"),
+    ]:
+        sample = _sample({}, meta={
+            "reuse_key": "doc:0", "endpoint": endpoint, "model": model,
+            "cache_class": cls, "warmup": warmup, "cache_hint": hint,
+        })
+        sample.start_ts = ts
+        agg.add(sample)
+    summary = agg.summary()["cache_reuse"]
+    assert summary["first_touch_misses"] == 2
+    assert summary["retouch_misses"] == 2
+    assert summary["eviction_miss_share"] == 2 / 5
+    assert summary["by_tier"]["restore"]["retouch_misses"] == 1
+    path = tmp_path / "samples.jsonl"
+    agg.dump_samples_jsonl(str(path))
+    assert json.loads(path.read_text().splitlines()[0])["meta"]["cache_miss_kind"] == "retouch"
+
+
+def test_loop_bound_utilisation_unions_overlaps_and_comparison_omits_speedup():
+    from benchmaker.core.compare import RunRef, compare, render_comparison
+
+    agg = MetricsAggregator(start_time=0, end_time=10)
+    for ts, cls, ttft, think in [(0, "miss", 0.3, 0), (0.5, "device_hit", 0.02, 0),
+                                  (9, "device_hit", 0.03, 7.5)]:
+        sample = _sample({"ttft_s": ttft}, meta={
+            "cache_class": cls, "replay_concurrent_sessions": 2, "replay_think_s": think,
+        })
+        sample.start_ts = ts
+        agg.add(sample)
+    summary = agg.summary()
+    loop = summary["closed_loop"]
+    assert loop["busy_time_s"] == 2.5 and loop["utilisation"] == 0.25
+    assert loop["mean_think_s"] == 2.5 and loop["mean_service_s"] == 1
+    assert loop["offered_load_rps"] == pytest.approx(2 / 3.5)
+    assert loop["loop_bound"] and loop["cache_hit_rate"] == pytest.approx(2 / 3)
+    assert loop["cache_class_ttft_p50_s"]["device_hit"] == pytest.approx(0.025)
+    result = compare([RunRef("a", 0, "", {"throughput_rps": 3}), RunRef("b", 0, "", summary)],
+                     metrics=["rps"])
+    assert result["arms"]["b"]["metrics"]["rps"]["ratio_vs_ref"] is None
+    assert "device_hit 25.0" in render_comparison(result)

@@ -263,6 +263,8 @@ class SGLangGenerateWorkloadType(WorkloadType):
         if response.ok and prompt_tokens is not None:
             info = CacheClassInfo(prompt_tokens=prompt_tokens, cached_tokens=cached_tokens or 0,
                                   hint=_cache_source_of(mi_raw))
+            if info.hint is not None:
+                sample.meta["cache_hint"] = info.hint
             cache_class = (self._cache_classifier(info) if self._cache_classifier
                            else classify_cache(info, self._cache_full_hit_ratio))
             if cache_class is not None:

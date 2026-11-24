@@ -46,6 +46,49 @@ PrometheusMonitor(
 )
 ```
 
+### Host-tier KV restores
+
+Set `cache_restore: true` on one Prometheus monitor per engine metrics
+endpoint. Give each monitor a unique `name`. For an arms run, set the monitor
+URLs in each arm's config. This mode retains labels and the known restore
+counter families even when `metric_names` filters the periodic telemetry.
+
+```yaml
+monitors:
+  - type: prometheus
+    name: vllm-model-a
+    url: http://localhost:8000/metrics
+    cache_restore: true
+    bytes_per_token: 294912  # optional, use the deployed engine's host KV geometry
+```
+
+The runner takes scrapes before the first request and after the in-flight
+requests drain. `summary.cache_restores` lists the counter selectors and their
+deltas for that step (one arm repetition in `benchmaker arms`), including any
+in-step warm-up traffic. Use a metrics endpoint scoped to the benchmark.
+Engines may publish stats asynchronously or only create series after the first
+restore. Prime lazy exporters before the step when needed. A missing boundary,
+missing series, or observed reset leaves the corresponding metric unavailable.
+
+- vLLM V1 uses the host source label where present and the native connector's
+  load bytes or blocks. With older versions, supply `bytes_per_token` or
+  `block_size_tokens` for a token estimate.
+  [Connector metrics](https://github.com/vllm-project/vllm/blob/v0.34.0/vllm/distributed/kv_transfer/kv_connector/v1/offloading/metrics.py)
+- LMCache uses completed retrieve hits in the legacy exporter. The
+  multiprocess exporter provides a lookup-based token estimate and, when
+  enabled, host-to-device staging bytes.
+  [Legacy exporter](https://github.com/LMCache/LMCache/blob/v0.4.4/lmcache/observability.py)
+  [Multiprocess metrics](https://github.com/LMCache/LMCache/blob/v0.5.8/docs/source/mp/observability/metrics.rst)
+- SGLang HiCache uses host-hit tokens or aggregate CPU-to-GPU load-back
+  counters. Physical load-back bytes cover all reporting ranks.
+  [SGLang metrics collector](https://github.com/sgl-project/sglang/blob/v0.5.23/python/sglang/srt/observability/metrics_collector.py)
+
+The restored share divides restored tokens by prompt tokens in the same step.
+`compare` labels these results **aggregate only**. Request-level cache classes
+and their TTFT remain based on response telemetry. Where the engine supports
+explicit `restored_tokens` response usage, Benchmaker also reports the share over
+the measured responses when every successful response supplies those counts.
+
 - `metric_names` is matched against the *bare* metric name (before `{labels}`).
 - With `labelled_keys=True` (default), the series `vllm:gpu_util{gpu="0"} 0.8`
   is recorded under the key `vllm:gpu_util{gpu="0"}`. Different label sets

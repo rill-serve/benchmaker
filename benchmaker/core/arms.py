@@ -757,9 +757,12 @@ class ArmsRunner:
 
         result = self.compare()
         write_comparison(result, self.root)
+        counts = result["signoff"]
+        self._say(f"[arms] {counts['passed']} passed, {counts['void']} void, "
+                  f"{counts['failed']} failed, {counts['warmup']} warm-up "
+                  f"in {time.monotonic() - t_all:.1f}s -> {self.root}")
         with open(os.path.join(self.root, "arms.log"), "w") as f:
             f.write("\n".join(self.log_lines) + "\n")
-        self._say(f"[arms] all done in {time.monotonic() - t_all:.1f}s -> {self.root}")
         return result
 
     def compare(self) -> dict:
@@ -768,6 +771,8 @@ class ArmsRunner:
     def exit_code(self, result: dict) -> int:
         if result.get("same_job_violations") and not self.settings.allow_mixed_jobs:
             return 2
+        if not result["signoff"]["passed"]:
+            return 1
         return 0
 
 
@@ -777,6 +782,17 @@ def build_comparison(runs: list[RunRef], settings: ArmsSettings) -> dict:
     result["order"] = settings.order
     result["reps"] = settings.reps
     result["warmup_reps"] = settings.warmup_reps
+    counts = {"passed": 0, "void": 0, "failed": 0, "warmup": 0}
+    for r in runs:
+        if r.warmup:
+            counts["warmup"] += 1
+        elif r.is_void():
+            counts["void"] += 1
+        elif r.summary.get("success") == 0:
+            counts["failed"] += 1
+        else:
+            counts["passed"] += 1
+    result["signoff"] = counts
     result["same_job_violations"] = check_same_job(runs, allow_mixed=True)
     parity = ttft_parity(runs)
     result["ttft_parity"] = parity

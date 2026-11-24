@@ -23,6 +23,7 @@ per stage for a phased recipe with independent load models.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 from dataclasses import dataclass
@@ -83,6 +84,10 @@ class CapacityRevisitWorkload(Workload):
         if revisit_order not in ("sequential", "random", "shuffle"):
             raise ValueError(f"revisit_order must be sequential or random, got {revisit_order!r}")
         self._docs = self._load_documents(documents, path, text_field, n_docs, doc_tokens)
+        self._reuse_keys = {
+            doc.doc_id: "doc:" + hashlib.sha256(doc.text.encode("utf-8")).hexdigest()
+            for doc in self._docs
+        }
         self._items = self._build_items(revisit_order, seed)
         if stage == "warm":
             self._items = [it for it in self._items if it["meta"]["visit"] == "warm"]
@@ -130,6 +135,7 @@ class CapacityRevisitWorkload(Workload):
                 "visit": "warm" if warm else "revisit",
                 "pass_index": pass_index,
                 "doc_id": doc.doc_id,
+                "reuse_key": self._reuse_keys[doc.doc_id],
                 "doc_tokens": doc.doc_tokens,
                 "prompt_tokens_hint": doc.doc_tokens + (self._suffix_tokens if self._unique_suffix else 0),
             },
@@ -157,7 +163,6 @@ class CapacityRevisitWorkload(Workload):
         return None if self._loop else len(self._items)
 
     def content_hash(self) -> Optional[str]:
-        import hashlib
         return "sha256:" + hashlib.sha256(json.dumps(
             self._items, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
